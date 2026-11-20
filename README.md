@@ -4,7 +4,7 @@ Ask your Wingman a Star Citizen question and get an answer from a local library 
 
 ## Install
 
-1. Download **wiki_llm-0.1.0.zip** from [Releases](https://github.com/Fowlplaychiken/wingman-wikillm/releases/latest). Extract the `wiki_llm` folder into Wingman's **custom skills** folder. On Windows this is usually `%APPDATA%\ShipBit\WingmanAI\custom_skills`. Inside `wiki_llm` you should see `default_config.yaml`.
+1. Download **wiki_llm-0.1.1.zip** from [Releases](https://github.com/Fowlplaychiken/wingman-wikillm/releases/latest). Extract the `wiki_llm` folder into Wingman's **custom skills** folder. On Windows this is usually `%APPDATA%\ShipBit\WingmanAI\custom_skills`. Inside `wiki_llm` you should see `default_config.yaml`.
 2. Reopen Wingman and enable **Star Citizen WikiLLM** for the Wingman you use.
 3. Ask **“Use the Star Citizen wiki. What makes driving on Aberdeen difficult? Show me the sources.”**
 

@@ -30,7 +30,7 @@ class DistributionPrivacyTests(unittest.TestCase):
                 archive = build.build(root / "dist")
             with zipfile.ZipFile(archive) as bundle:
                 self.assertEqual(set(bundle.namelist()), {
-                    "wiki_llm/" + name.replace("dependencies/wingman_wiki/", "dependencies/wingman_wiki_v0_1_0/")
+                    "wiki_llm/" + name.replace("dependencies/wingman_wiki/", "dependencies/wingman_wiki_v0_1_1/")
                     for name in (*build.FILES, "LICENSE", "README.md")})
                 self.assertFalse(any(marker.encode() in bundle.read(k) for k in bundle.namelist()))
 
