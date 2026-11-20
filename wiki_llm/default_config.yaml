@@ -1,0 +1,26 @@
+module: skills.wiki_llm.main
+name: WingmanWikiLLM
+api_version: 3
+version: 0.1.1
+display_name: Star Citizen WikiLLM
+author: Wingman WikiLLM contributors
+description:
+  en: Look up Star Citizen guides offline, cite original sources and keep your own field notes.
+tags:
+- Star Citizen
+- Knowledge
+discovery_keywords:
+- Star Citizen wiki
+- Galactapedia
+- look up a game mechanic
+- save a field note
+- local wiki
+discoverable_by_default: true
+auto_activate: false
+custom_properties:
+- id: auto_refresh
+  name: Update the reference library in the background
+  hint: Check public sources while the skill is loaded. Switch off for strictly offline use.
+  property_type: boolean
+  value: true
+  required: false
