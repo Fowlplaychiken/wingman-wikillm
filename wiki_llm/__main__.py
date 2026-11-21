@@ -31,10 +31,13 @@ def main():
     commands.add_parser("status", help="Show local coverage of enabled sources")
     refresh = commands.add_parser("refresh", help="Update enabled sources once")
     refresh.add_argument("--batch-size", type=int, default=5)
+    refresh.add_argument("--no-galactapedia", action="store_true", help="Skip the community Galactapedia API")
     snapshot = commands.add_parser("import", help="Import a local MediaWiki XML, article JSONL or the September 2023 Star Citizen archive")
     snapshot.add_argument("path", type=Path)
     inventory = commands.add_parser("verify", help="Compare saved article text against a publisher URL/revision inventory")
     inventory.add_argument("manifest", type=Path)
+    inventory.add_argument("--queue-missing", action="store_true",
+                           help="Queue undiscovered articles of enabled custom wikis for the next refresh")
     args = parser.parse_args()
     db = community_db_path(args.db)
     try:
@@ -51,13 +54,14 @@ def main():
         elif args.command == "status":
             result = library_status(db, **options)
         elif args.command == "verify":
-            result = check_inventory(db, args.manifest, **options)
+            result = check_inventory(db, args.manifest, queue_missing=args.queue_missing, **options)
         elif args.command == "import":
             result = import_snapshot(db, args.path, **snapshot_limits())
         else:
             result = asdict(refresh_once(db, batch_size=args.batch_size, enabled_catalogs=() if args.no_sc else None,
                                          roots=roots, import_snapshots=True,
-                                         include_sc_edition=not args.no_sc))
+                                         include_sc_edition=not args.no_sc,
+                                         sync_galactapedia=not (args.no_sc or args.no_galactapedia)))
     except (OSError, ValueError) as exc:
         parser.error(str(exc))
     print(json.dumps(result, ensure_ascii=True))

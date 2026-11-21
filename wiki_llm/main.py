@@ -59,7 +59,8 @@ class WingmanWikiLLM(Skill):
             catch_up=setting("catch_up", True), batch_size=int(pages),
             enabled_catalogs=None if online and self._sc else (),
             roots=self._roots if online else (), import_snapshots=True,
-            include_sc_edition=self._sc)
+            include_sc_edition=self._sc,
+            sync_galactapedia=online and self._sc and setting("sync_galactapedia", True))
         self._refresh.start()
 
     async def unload(self):

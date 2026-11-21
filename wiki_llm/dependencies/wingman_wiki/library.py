@@ -7,9 +7,9 @@ from pathlib import Path
 from urllib.parse import urldefrag, urlsplit
 
 from . import corpus
-from .coverage import SQLITE_WHITESPACE, full_pages, verify_inventory
+from .coverage import SQLITE_WHITESPACE, full_pages, renamed_articles, verify_inventory
 from .snapshots import read_snapshot_page, search_snapshots
-from .web_sources import in_scope, read_web_page, search_web_sources, web_coverage
+from .web_sources import in_scope, queue_inventory_urls, read_web_page, search_web_sources, web_coverage
 from .reference import WikiReference, _build_key, _query_terms, community_db_path
 
 _SCHEMA = """
@@ -147,6 +147,15 @@ def read_page(db_path, url, *, offset=0, include_star_citizen=True, roots=()):
     if not selected and not (include_star_citizen and permanent):
         return {"status": "unavailable"}
     if selected:
+        # Galactapedia keeps its article ID when the publisher changes a title
+        # slug. A player's earlier citation can still open the current edition.
+        if include_star_citizen and url.startswith(corpus.GALACTAPEDIA + "/article/"):
+            path = community_db_path(db_path)
+            canonical = renamed_articles(path, url).get(url)
+            if canonical:
+                current = read_snapshot_page(path, canonical, offset)
+                if current["status"] != "not_found":
+                    return {**current, "requested_url": url, "renamed": True}
         saved = read_snapshot_page(community_db_path(db_path), url, offset)
         if saved["status"] != "not_found":
             return saved
@@ -164,8 +173,10 @@ def read_page(db_path, url, *, offset=0, include_star_citizen=True, roots=()):
     return read_web_page(community_db_path(db_path), url, roots, offset=offset)
 
 
-def check_inventory(db_path, manifest, *, include_star_citizen=True, roots=()):
-    return verify_inventory(community_db_path(db_path), manifest, lambda url: _selected(url, include_star_citizen, roots))
+def check_inventory(db_path, manifest, *, include_star_citizen=True, roots=(), queue_missing=False):
+    path = community_db_path(db_path)
+    return verify_inventory(path, manifest, lambda url: _selected(url, include_star_citizen, roots),
+                            queue_undiscovered=(lambda urls: queue_inventory_urls(path, roots, urls)) if queue_missing else None)
 
 
 def library_status(db_path=None, *, include_star_citizen=True, roots=()):
@@ -209,7 +220,7 @@ def library_status(db_path=None, *, include_star_citizen=True, roots=()):
             "community": "automatic_paced_excerpts",
             "support": "local_import_only",
             "official": "local_import_only",
-            "galactapedia": "local_import_only",
+            "galactapedia": "community_api_or_local_import",
         }
         catalog_names = ("community", "support", "official", "galactapedia")
         last_updates = {row["name"]: row for row in _read(
@@ -232,6 +243,12 @@ def library_status(db_path=None, *, include_star_citizen=True, roots=()):
             source_state = last_updates.get(name, {})
             group.update(last_success=source_state.get("last_success"),
                          last_error=source_state.get("last_error"))
+        from .galactapedia_feed import feed_status
+        feed = status["galactapedia_feed"] = feed_status(path)
+        if feed["last_success"] is not None:
+            counts["galactapedia"]["coverage_basis"] = "validated Star Citizen Wiki API Galactapedia inventory"
+            last_updates["galactapedia"] = {"last_success": feed["last_success"], "last_error": feed["last_error"]}
+            counts["galactapedia"].update(last_updates["galactapedia"])
         status.update(star_citizen_library=counts, last_updates=[
             {"name": name, **last_updates.get(name, {"last_success": None, "last_error": None}),
              "automatic_acquisition": acquisitions[name]}
@@ -273,6 +290,13 @@ def library_status(db_path=None, *, include_star_citizen=True, roots=()):
             status["coverage_summary"] += (
                 f" The September 2023 community archive contains {historical_articles:,} saved articles. "
                 "Full-text counts include historical revisions and do not establish current patch coverage."
+            )
+        if feed["last_success"] is not None:
+            status["coverage_summary"] += (
+                f" The Galactapedia feed lists {feed['titles']:,} entries. It supplied "
+                f"{feed['article_bodies']:,} English articles, with {feed['placeholders']:,} placeholders "
+                f"and {feed['missing']:,} missing translations. Older text is retained for "
+                f"{feed['retained_prior_bodies']:,} of those gaps."
             )
     else:
         status["coverage_totals"] = {

@@ -49,6 +49,25 @@ class SnapshotTests(unittest.TestCase):
     def tearDown(self):
         self._temporary.cleanup()
 
+    def test_failed_catalog_publish_rolls_back_bodies_and_search(self):
+        db = self.tmp_path / "wiki.sqlite3"
+        source = self.tmp_path / "articles.jsonl"
+        article = {"url": "https://wiki.example.org/Engine", "title": "Engine", "text": "Old turbine"}
+        source.write_text(json.dumps(article), encoding="utf-8")
+        import_snapshot(db, source)
+
+        def interrupted(con, source_id):
+            con.execute("UPDATE snapshot_sources SET file_format='unpublished' WHERE source_id=?", (source_id,))
+            raise RuntimeError("Interrupted catalog update")
+
+        for body in ("Old turbine", "New thruster"):
+            source.write_text(json.dumps({**article, "text": body}), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "Interrupted catalog"):
+                import_snapshot(db, source, on_publish=interrupted)
+            page = read_snapshot_page(db, article["url"])
+            self.assertEqual((page["file_format"], page["text"]), ("jsonl", "Old turbine"))
+            self.assertFalse(search_snapshots("thruster", db))
+
     def test_mediawiki_import_indexes_latest_revision_namespace_redirect_and_links(self):
         tmp_path = self.tmp_path
         source = tmp_path / "game.xml"

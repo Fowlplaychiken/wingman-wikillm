@@ -1,4 +1,5 @@
 """Independent public-wiki fixtures; no live contacts or model calls."""
+import json
 from pathlib import Path
 import socket
 import sqlite3
@@ -8,7 +9,7 @@ from unittest.mock import patch
 import pytest
 
 from wiki_llm.dependencies.wingman_wiki import web_sources as web
-from wiki_llm.dependencies.wingman_wiki.library import record_note
+from wiki_llm.dependencies.wingman_wiki.library import check_inventory, record_note
 
 A = "https://wiki.example/game-a/Main_Page"
 B = "https://wiki.example/game-b/Main_Page"
@@ -719,6 +720,78 @@ def test_sparse_home_page_still_discovers_links_and_declared_api(tmp_path):
     second = source.run(db, (root,), batch_size=1)
     assert second['indexed'] == 1 and len(source.api_calls) == 1
     assert web.search_web_sources('gameplay manual', db, (root,))
+
+
+def test_short_definition_and_table_value_are_indexed_but_navigation_is_only_discovery(tmp_path):
+    source, db = Fixture(), tmp_path / 'library.sqlite3'
+    unit = A.replace("Main_Page", "Unit")
+    mass = A.replace("Main_Page", "Mass")
+    source.pages[A] = f'<html><article><p><a href="{unit}">Unit</a></p><a href="{mass}">Mass</a></article></html>'.encode()
+    source.pages[unit] = html('Unit', text='One crate.')
+    source.pages[mass] = b'<html><article><table><tr><td>8 kg</td></tr></table></article></html>'
+    source.run(db, batch_size=5)
+    for url, value in ((unit, 'One crate.'), (mass, '8 kg')):
+        assert value in str(web.read_web_page(db, url, (A,))['passages'])
+    assert web.read_web_page(db, A, (A,))['status'] == 'unavailable'
+
+
+def test_upgrade_recovers_menu_from_unchanged_home_then_resumes_conditional_requests(tmp_path):
+    source, db = Fixture(), tmp_path / 'library.sqlite3'
+    branch = A.replace('Main_Page', 'Unlinked_branch')
+    page = html('Game A').replace(b'<body>', f'<body><nav><a href="{branch}">Guide</a></nav>'.encode())
+    source.pages[A] = web.Response(200, {'etag': '"same"'}, page)
+    source.pages[branch] = html('Branch', 'Rare crystals.')
+    source.run(db, (A,), batch_size=1)
+    with sqlite3.connect(db) as conn:
+        conn.execute('DELETE FROM web_pages WHERE url=?', (branch,))
+        conn.execute('ALTER TABLE web_pages DROP COLUMN links_scanned')
+    source.calls.clear()
+    source.run(db, (A,), batch_size=2)
+    url, headers = source.calls[0]
+    assert url == A and not any(key.lower().startswith('if-') for key in headers)
+    assert web.read_web_page(db, branch, (A,))['status'] == 'reference'
+    source.pages[A] = web.Response(304, {}, b'')
+    source.now += 604_801
+    source.calls.clear()
+    source.run(db, (A,), batch_size=2)
+    headers, = (headers for url, headers in source.calls if url == A)
+    assert {k.lower(): v for k, v in headers.items()}['if-none-match'] == '"same"'
+
+
+def test_publisher_inventory_recovers_every_enabled_orphan_and_ignores_other_games(tmp_path):
+    db, manifest, source = tmp_path / 'library.sqlite3', tmp_path / 'manifest.jsonl', Fixture()
+    source.pages[A] = html('Home')
+    urls = [A.replace('Main_Page', f'Hidden_{n}') for n in range(13)]
+    for url in urls:
+        source.pages[url] = html('Hidden fact', 'Number of moons is two.')
+    manifest.write_text(''.join(json.dumps({'url': u}) + '\n' for u in [*urls, B]), encoding='utf8')
+    options = dict(roots=(A,), include_star_citizen=False, queue_missing=True)
+    first = check_inventory(db, manifest, **options)
+    assert (first['new_urls_queued'], len(first['first_gaps']), first['disabled']) == (13, 10, 1)
+    assert check_inventory(db, manifest, **options)['new_urls_queued'] == 0 and not source.calls
+    source.run(db, (A,), batch_size=20)
+    assert all(url != B for url, _ in source.calls)
+    final = check_inventory(db, manifest, **options)
+    assert (final['present'], final['missing_text'], final['disabled'], final['new_urls_queued']) == (13, 0, 1, 0)
+
+
+def test_reference_only_change_replaces_cached_full_text_and_upgrades_when_allowed(tmp_path):
+    source, db = Fixture(), tmp_path / 'library.sqlite3'
+    prose = ' '.join(f'term{i}' for i in range(45))
+    source.pages[A] = web.Response(200, {'etag': '"same"'}, html('Guide', prose))
+    source.run(db)
+    source.robots += 'Content-Signal: search=yes, ai-train=no, use=reference\n'
+    source.now += 86_401
+    source.run(db)
+    with sqlite3.connect(db) as conn:
+        assert conn.execute('SELECT storage_mode FROM web_pages WHERE url=?', (A,)).fetchone() == ('short_excerpt',)
+        assert 'term44' not in str(conn.execute('SELECT text FROM web_passages').fetchall())
+    source.robots = 'User-agent: *\nAllow: /'
+    source.now += 86_401
+    source.run(db)
+    with sqlite3.connect(db) as conn:
+        assert conn.execute('SELECT storage_mode FROM web_pages WHERE url=?', (A,)).fetchone() == ('full_text',)
+        assert 'term44' in str(conn.execute('SELECT text FROM web_passages').fetchall())
 
 
 def test_publisher_nofollow_does_not_register_api_or_guess_one(tmp_path):

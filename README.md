@@ -31,7 +31,8 @@ Ask **“How much of my wiki is available offline?”** to see what the library 
 
 | Source | What WikiLLM saves |
 | --- | --- |
-| Star Citizen preset | Cited starter guides, dated articles from the September 2023 community archive, and short excerpts from newer community pages. Words in lists and tables can also locate a page by title and link. Previously saved Galactapedia, RSI Support and Comm-Link titles and links remain searchable. |
+| Star Citizen Wiki | Cited starter guides, the September 2023 community article archive and short excerpts from newer community pages. Search also finds terms in lists and tables. |
+| Galactapedia | English lore articles for personal offline use, supplied by the Star Citizen Wiki community API. Answers link to the original RSI article. Coverage shows when an entry has only a title or a publisher placeholder. Turn off **Update Galactapedia lore** to keep just the saved edition. [API and usage terms](https://api.star-citizen.wiki/developers) |
 | Other public wikis | Article passages on supported openly licensed pages, or a short excerpt where appropriate. Publishers can exclude paths or disallow storage. WikiLLM also checks for unlinked articles on compatible MediaWiki sites with an accessible page-list API. A sign-in, a JavaScript-only page or an unpublished page list can leave a gap. |
 | Local exports | Full article text from a MediaWiki XML (plain, gzip or bzip2) or article JSONL export (plain or gzip) you have permission to use, from any public source. Add its original article URL to an enabled source (supported RSI article routes use the Star Citizen preset; other publishers use **Other game wikis**). Place the file in the library’s `snapshots` folder for local import on the next background pass. Importing never contacts that publisher. Replace the same file to update it. |
 | Your field notes | Your observations, sources, game builds and corrections. Reviewed notes appear in answers. Drafts and withdrawn notes stay in the revision history. |
@@ -54,13 +55,17 @@ Star Citizen Wiki contributors wrote the articles, distributed under CC BY-SA 4.
 
 ## Updates and backups
 
-The updater checks hourly while the skill is loaded. While it is making progress on newly discovered community wiki pages, it can take another batch after two minutes. Turn off **Build new libraries between scheduled updates** to use only your chosen interval. You can change the interval and batch size in the skill settings. Community site delays and retries still apply. RSI Terms section IV does not permit automated collection, so the built-in updater does not request RSI or RSI Support sitemaps or Galactapedia's catalog. Existing local title caches remain available, and authorized exports are imported locally. [RSI Terms](https://robertsspaceindustries.com/en/tos) · [Community wiki content signals](https://starcitizen.tools/robots.txt) · [Community wiki licensing](https://starcitizen.tools/Star_Citizen_Wiki:Copyrights)
+The updater checks hourly while the skill is loaded. During a first sync it can take another batch of newly discovered community pages after two minutes. Change the interval and batch size in skill settings, or turn off **Build new libraries between scheduled updates**. WikiLLM obtains Galactapedia through the community API. Previously cached RSI Support and Comm-Link titles stay searchable. [Galactapedia API](https://api.star-citizen.wiki/developers) · [RSI terms](https://robertsspaceindustries.com/en/tos) · [Community wiki content signals](https://starcitizen.tools/robots.txt)
 
-**Coverage is local and source-specific.** Status separates indexed title URLs, saved community excerpts, and complete article text. Its deterministic Star Citizen preset totals count each known URL once and state full-text coverage among those known URLs. Local imports are totaled separately by unique URL and publisher origin; an import can overlap a known URL, so do not add the two totals. Private notes are excluded from source-coverage counts. A title or excerpt is not full-text coverage; custom-wiki coverage is based on URLs discovered so far, not a complete publisher inventory. A complete current export or independently supplied inventory is needed to account for unlinked pages.
+**Check what you can read offline.** Ask Wingman for wiki coverage. It counts known titles, short excerpts and full articles separately. For Galactapedia it compares saved English articles with the API’s complete list and shows any missing translations or publisher placeholders. If a title changes, an earlier saved RSI link still opens the article when the publisher keeps its ID.
+
+For a wiki you add, the count covers pages discovered so far. Compare it with a publisher’s article list or import its complete export to account for unlinked pages. Each URL counts once per library. Imports can overlap the Star Citizen totals. Private notes have their own history.
 
 Back up the `.starcitizen-wiki` folder in your user home with Wingman closed. It holds the database, notes and any exports you added. To update the skill, replace only its folder under `custom_skills`. WikiLLM works independently of other skills and requires no Wingman Core changes.
 
 **Later syncs reuse your library.** WikiLLM checks publisher update dates and HTTP change indicators when available. A changed child sitemap can reveal a new article even when its parent index stays the same. Sites without change indicators may require another page download to detect an edit. Replacing a local export updates changed, new and removed articles while preserving your notes. [Sitemap update dates](https://www.sitemaps.org/protocol.html) · [HTTP conditional requests](https://www.rfc-editor.org/rfc/rfc9110.html#name-conditional-requests)
+
+If you already added another game in an earlier version, WikiLLM reads its home page again to recover menu links. Other previously saved pages get the same one-time check as they come due. Galactapedia sends changes in groups of articles. One edit can require downloading its group again.
 
 <details>
 <summary>Use the library from another assistant or the command line</summary>
@@ -75,10 +80,12 @@ python -m wiki_llm --no-sc --wiki https://wiki.openttd.org/en/Manual/ status
 python -m wiki_llm --no-sc --wiki https://wiki.openttd.org/en/Manual/ lookup "railways"
 python -m wiki_llm import game-wiki.xml
 python -m wiki_llm review
-python -m wiki_llm --no-sc --wiki https://wiki.wesnoth.org/ verify publisher-inventory.jsonl
+python -m wiki_llm --no-sc --wiki https://wiki.wesnoth.org/ verify publisher-inventory.jsonl --queue-missing
 ```
 
 These commands return JSON. Supply `--wiki` once per enabled address on each command. A lookup or page read stays offline. A refresh contacts enabled publishers. For JSONL exports, use one object per line with `url`, `title` and `text`. You can also supply `revision` and `game_build`. The optional inventory check compares every listed `url` and, when provided, its exact `revision` against saved article text. Use a current publisher list independent of the crawl. An excerpt cannot pass this check. Use `--db` or `SC_WIKI_DB` to choose another database.
+
+Use `--queue-missing` with an inventory to add undiscovered URLs from your enabled custom wikis to the next refresh. Run the check again afterward to see which pages now have article text.
 
 For a large export, the default limits per file are 512 MiB on disk, 2 GiB expanded and 2 million pages. Set `WIKILLM_SNAPSHOT_MAX_COMPRESSED_BYTES`, `WIKILLM_SNAPSHOT_MAX_EXPANDED_BYTES` or `WIKILLM_SNAPSHOT_MAX_PAGES` before launching Wingman or the command. Each accepts a positive integer, or zero to remove that aggregate limit.
 

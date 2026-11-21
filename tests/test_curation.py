@@ -54,6 +54,16 @@ def _load_main_module():
 
 
 class CurationTests:
+    def test_galactapedia_refresh_respects_online_game_and_source_switches(self):
+        module = _load_main_module()
+        for settings in ({}, {"include_star_citizen": False}, {"auto_refresh": False},
+                         {"sync_galactapedia": False}):
+            skill = module.WingmanWikiLLM()
+            skill.properties.update(settings)
+            with patch.object(module, "RefreshScheduler") as scheduler:
+                asyncio.run(skill.prepare())
+                assert scheduler.call_args.kwargs["sync_galactapedia"] is (not settings)
+
     def test_enabled_prompt_limits_private_drafts_to_player_evidence(self):
         module = _load_main_module()
         skill = module.WingmanWikiLLM()

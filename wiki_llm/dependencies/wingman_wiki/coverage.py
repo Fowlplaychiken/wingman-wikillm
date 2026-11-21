@@ -1,8 +1,11 @@
 """Offline coverage of configured sources and a publisher-supplied article inventory."""
 import json
+import re
 import sqlite3
 from contextlib import closing
 from pathlib import Path
+
+from .corpus import GALACTAPEDIA
 
 SQLITE_WHITESPACE = "\t\n\v\f\r \x1c\x1d\x1e\x1f\x85\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000"
 
@@ -28,9 +31,39 @@ def full_pages(db_path):
     return pages
 
 
-def verify_inventory(db_path, manifest, allowed):
+def renamed_articles(db_path, requested=None):
+    """Match a retired Galactapedia citation to a unique current publisher ID."""
+    prefix = GALACTAPEDIA + "/article/"
+    if requested is not None and not requested.startswith(prefix):
+        return {}
+    path = Path(db_path)
+    if not path.is_file():
+        return {}
+    with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as db:
+        if not db.execute("SELECT 1 FROM sqlite_master WHERE name='wiki_urls'").fetchone():
+            return {}
+        if requested is None:
+            retired = db.execute("SELECT url FROM wiki_urls WHERE status='removed' AND url GLOB ?",
+                                 (prefix + "*",))
+        else:
+            retired = db.execute("SELECT url FROM wiki_urls WHERE status='removed' AND url=?", (requested,))
+        aliases = {}
+        for (old,) in retired:
+            slug = re.fullmatch(r"([A-Za-z0-9]+)-[^/?#]+", old[len(prefix):])
+            if slug:
+                current = db.execute("SELECT url FROM wiki_urls WHERE status!='removed' AND url GLOB ? LIMIT 2",
+                                     (prefix + slug[1] + "-*",)).fetchall()
+                if len(current) == 1:
+                    aliases[old] = current[0][0]
+    return aliases
+
+
+def verify_inventory(db_path, manifest, allowed, *, queue_undiscovered=None):
     """Check every expected URL and optional revision without contacting a wiki."""
     saved = full_pages(db_path)
+    for old, current in renamed_articles(db_path).items():
+        if current in saved:
+            saved.setdefault(old, set()).update(saved[current])
     seen = {}
     counts = {"present": 0, "missing_text": 0, "revision_unverified": 0, "disabled": 0}
     examples = []
@@ -67,5 +100,8 @@ def verify_inventory(db_path, manifest, allowed):
                 examples.append({"url": url, "reason": reason})
     if not seen:
         raise ValueError("The article inventory is empty.")
-    return {"status": "matches_inventory" if counts["present"] == len(seen) else "incomplete",
-            "expected_articles": len(seen), **counts, "first_gaps": examples}
+    result = {"status": "matches_inventory" if counts["present"] == len(seen) else "incomplete",
+              "expected_articles": len(seen), **counts, "first_gaps": examples}
+    if queue_undiscovered is not None:
+        result["new_urls_queued"] = queue_undiscovered(url for url in seen if url not in saved and allowed(url))
+    return result
