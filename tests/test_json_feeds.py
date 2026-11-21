@@ -1,0 +1,214 @@
+"""Bounded offline tests for public JSON API snapshots."""
+import json
+import sqlite3
+from unittest.mock import patch
+
+import pytest
+
+from wiki_llm.dependencies.wingman_wiki import json_feeds as feeds
+from wiki_llm.dependencies.wingman_wiki import web_sources
+from wiki_llm.dependencies.wingman_wiki.snapshots import read_snapshot_page, search_snapshots
+
+
+API = "https://api.open5e.com/v2/conditions/"
+ARTICLE_A = "https://www.open5e.com/conditions/cold/"
+ARTICLE_B = "https://www.open5e.com/conditions/fear/"
+
+
+def _body(items, *, next_url=None, total=2):
+    return json.dumps({"count": total, "next": next_url, "results": items}).encode()
+
+
+def _item(name, slug, description):
+    return {"name": name, "slug": slug, "desc": [{"desc": description}]}
+
+
+class Fixture:
+    def __init__(self):
+        self.calls = []
+        self.policy = None
+        self.pages = {
+            API: ("page-1", _body([_item("Cold", "cold", "Cold imposes a slowing effect." )],
+                                  next_url="?page=2")),
+            API + "?page=2": ("page-2", _body([_item("Fear", "fear", "Fear can disrupt concentration.")]))
+        }
+
+    def __call__(self, url, headers, *, validate_url):
+        validate_url(url)
+        self.calls.append((url, dict(headers)))
+        if url.endswith("/robots.txt"):
+            return web_sources.Response(404, {}, b"")
+        etag, body = self.pages[url]
+        if headers.get("If-None-Match") == etag:
+            policy = self.policy if url == API else None
+            response_headers = {"ETag": etag}
+            if policy:
+                response_headers.update(policy)
+            return web_sources.Response(304, response_headers, b"")
+        return web_sources.Response(200, {"Content-Type": "application/json", "ETag": etag}, body)
+
+
+@pytest.fixture(autouse=True)
+def no_host_delay():
+    with patch.object(web_sources.corpus, "robots_delay", return_value=0):
+        yield
+
+
+def mapped_feed():
+    return feeds.parse_feeds(json.dumps({
+        "url": API,
+        "items": "results",
+        "title": "name",
+        "text": "desc.0.desc",
+        "url_template": "https://www.open5e.com/conditions/{id}/",
+        "id_field": "slug",
+        "next": "next",
+        "total": "count",
+    }))[0]
+
+
+def _install(monkeypatch, fixture):
+    monkeypatch.setattr(web_sources, "_transport", fixture)
+
+
+def test_mapping_supports_dotted_array_indices_and_default_aliases():
+    feed = mapped_feed()
+    assert feeds._normalized(_item("Cold", "cold", "A cold description."), feed) == {
+        "url": ARTICLE_A, "title": "Cold", "text": "A cold description."
+    }
+    default = feeds.parse_feeds(API)[0]
+    assert default.items == "results|items|data|records|entries"
+    assert feeds._normalized({"name": "Ice", "description": ["First.", "Second."],
+                              "link": ARTICLE_A}, default)["text"] == "First.\nSecond."
+
+
+def test_refresh_publishes_complete_feed_and_reuses_each_page_validator(tmp_path, monkeypatch):
+    fixture = Fixture()
+    _install(monkeypatch, fixture)
+    feed = mapped_feed()
+    db = tmp_path / "wiki.sqlite3"
+    clock = lambda: 1_800_000_000.0
+
+    first = feeds.refresh_feeds(db, (feed,), clock=clock)
+    assert first[feed.url]["status"] == "ready"
+    assert first[feed.url]["articles"] == 2
+    status = feeds.feed_status(db, feed, clock=clock)
+    assert status["readable"] is True and status["articles"] == 2
+
+    snapshot_db = feeds.feed_db_path(db, feed)
+    result = read_snapshot_page(snapshot_db, ARTICLE_A)
+    assert result["status"] == "snapshot" and result["text"] == "Cold imposes a slowing effect."
+    assert search_snapshots("disrupt concentration", snapshot_db)[0]["url"] == ARTICLE_B
+
+    with sqlite3.connect(db) as state_db:
+        state_db.execute("UPDATE json_feed_state SET next_attempt=0 WHERE url=?", (feed.url,))
+    second = feeds.refresh_feeds(db, (feed,), clock=clock)
+    assert second[feed.url]["status"] == "ready"
+    conditionals = [(url, headers.get("If-None-Match")) for url, headers in fixture.calls
+                    if url in fixture.pages and headers.get("If-None-Match")]
+    assert conditionals[-2:] == [(API, "page-1"), (API + "?page=2", "page-2")]
+    assert feeds.feed_status(db, feed)["articles"] == 2
+
+
+@pytest.mark.parametrize("policy", [
+    {"X-Robots-Tag": "noarchive"},
+    {"Cache-Control": "private, no-store"},
+    {"Content-Signal": "use=reference"},
+])
+def test_policy_change_on_304_hides_and_purges_published_copy(tmp_path, monkeypatch, policy):
+    fixture = Fixture()
+    _install(monkeypatch, fixture)
+    feed = mapped_feed()
+    db = tmp_path / "wiki.sqlite3"
+    feeds.refresh_feeds(db, (feed,), clock=lambda: 1_800_000_000.0)
+    with sqlite3.connect(db) as state_db:
+        state_db.execute("UPDATE json_feed_state SET next_attempt=0 WHERE url=?", (feed.url,))
+    fixture.policy = policy
+
+    result = feeds.refresh_feeds(db, (feed,), clock=lambda: 1_800_000_001.0)
+    assert result[feed.url]["status"] == "blocked"
+    assert feeds.feed_status(db, feed)["readable"] is False
+    assert search_snapshots("slowing effect", feeds.feed_db_path(db, feed)) == []
+
+
+def test_duplicate_article_urls_across_pages_do_not_publish(tmp_path, monkeypatch):
+    fixture = Fixture()
+    fixture.pages[API + "?page=2"] = ("page-2", _body(
+        [_item("Fear", "cold", "This repeats the first article URL.")]))
+    _install(monkeypatch, fixture)
+    feed = mapped_feed()
+
+    result = feeds.refresh_feeds(tmp_path / "wiki.sqlite3", (feed,), clock=lambda: 1_800_000_000.0)
+    assert result[feed.url]["status"] == "failed"
+    assert feeds.feed_status(tmp_path / "wiki.sqlite3", feed)["readable"] is False
+
+
+def test_total_mismatch_retry_restarts_the_staged_inventory(tmp_path, monkeypatch):
+    fixture = Fixture()
+    fixture.pages[API] = ("page-1-v1", _body(
+        [_item("Cold", "cold", "Cold imposes a slowing effect.")], next_url="?page=2", total=3))
+    fixture.pages[API + "?page=2"] = ("page-2-v1", _body(
+        [_item("Fear", "fear", "Fear can disrupt concentration.")], total=3))
+    _install(monkeypatch, fixture)
+    feed = mapped_feed()
+    db = tmp_path / "wiki.sqlite3"
+    first = feeds.refresh_feeds(db, (feed,), clock=lambda: 1_800_000_000.0)
+    assert first[feed.url]["status"] == "failed"
+
+    fixture.pages[API] = ("page-1-v2", _body(
+        [_item("Cold", "cold", "Cold imposes a slowing effect.")], next_url="?page=2", total=2))
+    fixture.pages[API + "?page=2"] = ("page-2-v2", _body(
+        [_item("Fear", "fear", "Fear can disrupt concentration.")], total=2))
+    with sqlite3.connect(db) as state_db:
+        state_db.execute("UPDATE json_feed_state SET next_attempt=0 WHERE url=?", (feed.url,))
+
+    retried = feeds.refresh_feeds(db, (feed,), clock=lambda: 1_800_000_001.0)
+    assert retried[feed.url]["status"] == "ready"
+    assert feeds.feed_status(db, feed)["articles"] == 2
+
+
+def test_sidecar_identity_includes_main_database_filename(tmp_path):
+    feed = mapped_feed()
+    first = feeds.feed_db_path(tmp_path / "one.sqlite3", feed)
+    second = feeds.feed_db_path(tmp_path / "two.sqlite3", feed)
+    assert first != second
+
+
+def test_empty_publisher_inventory_retires_previous_articles(tmp_path, monkeypatch):
+    fixture = Fixture()
+    _install(monkeypatch, fixture)
+    feed = mapped_feed()
+    db = tmp_path / "wiki.sqlite3"
+    feeds.refresh_feeds(db, (feed,), clock=lambda: 1_800_000_000)
+    fixture.pages[API] = ("empty", _body([], total=0))
+    cleared = feeds.refresh_feeds(db, (feed,), clock=lambda: 1_800_100_000)
+    assert cleared[feed.url]["articles"] == 0
+    assert read_snapshot_page(feeds.feed_db_path(db, feed), ARTICLE_A)["status"] == "not_found"
+    with sqlite3.connect(feeds.feed_db_path(db, feed)) as con:
+        assert con.execute("SELECT count(*) FROM source_changes WHERE reason='snapshot_page_removed'").fetchone()[0] == 2
+
+
+def test_http_link_pagination_survives_conditional_refresh(tmp_path, monkeypatch):
+    first = {"name": "First", "description": "A frozen lake.", "url": ARTICLE_A}
+    second = {"name": "Second", "description": "A second lake.", "url": ARTICLE_B}
+    later = API + "?cursor=a,b"
+    checked = []
+    def transport(url, headers, *, validate_url):
+        validate_url(url)
+        if url.endswith("/robots.txt"):
+            return web_sources.Response(404, {}, b"")
+        checked.append(url)
+        if "If-None-Match" in headers:
+            return web_sources.Response(304, {}, b"")
+        assert url in (API, later)
+        meta = {"ETag": url}
+        if url == API:
+            meta["Link"] = '<?page=1>; title="first, page"; rel="first", <?cursor=a,b>; rel="next"'
+        return web_sources.Response(200, meta, json.dumps([first if url == API else second]).encode())
+    _install(monkeypatch, transport)
+    feed = feeds.parse_feeds(API)[0]
+    db = tmp_path / "wiki.sqlite3"
+    for now in (1_800_000_000, 1_800_100_000):
+        result = feeds.refresh_feeds(db, (feed,), clock=lambda: now)
+        assert result[feed.url]["articles"] == 2
+    assert checked == [API, later, API, later]

@@ -810,7 +810,7 @@ def search_snapshots(query: object, db_path: Path | str, limit: int = 3, *,
         rows = db.execute(f"""SELECT p.source_id,p.page_key,p.url,p.source_origin,p.title,p.revision,s.file_format,
             p.revision_timestamp,p.namespace,p.namespace_name,p.redirect_target,p.game_build,
             snippet(snapshot_search,3,'[',']',' … ',36) AS excerpt,
-            bm25(snapshot_search) AS rank
+            bm25(snapshot_search,0,0,8,1) AS rank
             FROM snapshot_search JOIN snapshot_pages p
             ON p.source_id=snapshot_search.source_id AND p.page_key=snapshot_search.page_key
             JOIN snapshot_sources s ON s.source_id=p.source_id
@@ -820,8 +820,8 @@ def search_snapshots(query: object, db_path: Path | str, limit: int = 3, *,
             AND snapshot_source_allowed(p.source_origin)=1
             AND snapshot_url_allowed(p.url)=1
             AND p.rowid=({_CURRENT_PAGE.format(url="p.url")})
-            ORDER BY rank,p.source_origin,p.title,p.url LIMIT ?""",
-                         (match, requested_origin, requested_origin, game_build, game_build, limit)).fetchall()
+            ORDER BY (p.title=? COLLATE NOCASE) DESC,rank,p.source_origin,p.title,p.url LIMIT ?""",
+                         (match, requested_origin, requested_origin, game_build, game_build, query.strip(), limit)).fetchall()
         provenance = {row["url"]: _snapshot_provenance(row, db) for row in rows}
     results = []
     for row in rows:

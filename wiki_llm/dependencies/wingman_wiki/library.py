@@ -7,6 +7,7 @@ from pathlib import Path
 from urllib.parse import urldefrag, urlsplit
 
 from . import corpus
+from .json_feeds import feed_db_path, feed_status as api_status
 from .coverage import SQLITE_WHITESPACE, full_pages, renamed_articles, verify_inventory
 from .snapshots import read_snapshot_page, search_snapshots
 from .web_sources import in_scope, queue_inventory_urls, read_web_page, search_web_sources, web_coverage
@@ -107,19 +108,34 @@ def _source_changes(references, db_path):
                 ref.setdefault("changed_sources", []).append(row)
 
 
-def review_queue(db_path=None, *, after=None, limit=10):
+def _api_libraries(db_path, feeds):
+    for feed in feeds:
+        if api_status(db_path, feed).get("readable"):
+            yield feed, feed_db_path(db_path, feed)
+
+
+def review_queue(db_path=None, *, after=None, limit=10, feeds=(), topic=None):
     """List the latest drafts and reviewed notes affected by source changes."""
     if type(limit) is not int or not 1 <= limit <= 50 or (after is not None and not isinstance(after, str)):
         raise ValueError("Use a topic ID as the cursor and request 1 to 50 notes.")
     cursor, notes = after or "", []
+    terms = _query_terms(topic) if topic is not None else ()
+    if topic is not None and not terms:
+        return {"notes": [], "next_after": None}
+    topic_filter = ""
+    if terms:
+        topic_filter = " AND (" + " OR ".join("instr(lower(n.title || ' ' || n.slug), ?) > 0" for _ in terms) + ")"
+    feed_paths = [path for _, path in _api_libraries(community_db_path(db_path), feeds)]
     while len(notes) <= limit:
         batch = _read(db_path, """SELECT n.slug,n.title,n.revision,n.status,n.source AS citation,n.recorded_at
             FROM note_revisions n WHERE n.slug>? AND n.status!='withdrawn'
             AND n.revision=(SELECT max(r.revision) FROM note_revisions r WHERE r.slug=n.slug)
-            ORDER BY n.slug LIMIT 100""", (cursor,), "note_revisions")
+            """ + topic_filter + " ORDER BY n.slug LIMIT 100", (cursor, *terms), "note_revisions")
         if not batch:
             break
         _source_changes(batch, db_path)
+        for path in feed_paths:
+            _source_changes(batch, path)
         for row in batch:
             if row["status"] == "draft" or row.get("needs_review"):
                 row["reason"] = "draft" if row["status"] == "draft" else "source_changed"
@@ -136,14 +152,39 @@ def _selected(url, include_star_citizen, roots):
     return (include_star_citizen and corpus.indexable(url)) or any(in_scope(url, root) for root in roots)
 
 
-def read_page(db_path, url, *, offset=0, include_star_citizen=True, roots=()):
+def read_page(db_path, url, *, offset=0, include_star_citizen=True, roots=(), feeds=()):
     """Read an article from the currently enabled local sources."""
+    page = _read_publisher_page(db_path, url, offset, include_star_citizen, roots, feeds)
+    if offset or not (page.get("text") or page.get("passages")):
+        return page
+    # Keep player annotations alongside the publisher text and outside its update transaction.
+    urls = {urldefrag(u)[0] for u in (url, page.get("url"), page.get("citation")) if u}
+    marks = ",".join("?" for _ in urls)
+    notes = _read(db_path, f"""SELECT n.slug,n.title,n.finding,n.source AS citation,n.revision,n.recorded_at,n.game_build
+        FROM note_revisions n WHERE n.status='reviewed'
+        AND (CASE WHEN instr(n.source,'#')>0 THEN substr(n.source,1,instr(n.source,'#')-1) ELSE n.source END) IN ({marks})
+        AND n.revision=(SELECT max(r.revision) FROM note_revisions r WHERE r.slug=n.slug AND r.status!='draft')
+        ORDER BY n.recorded_at DESC LIMIT 5""", tuple(urls), "note_revisions")
+    if notes:
+        _source_changes(notes, db_path)
+        for _, path in _api_libraries(community_db_path(db_path), feeds):
+            _source_changes(notes, path)
+        page["private_annotations"] = notes
+    return page
+
+
+def _read_publisher_page(db_path, url, offset, include_star_citizen, roots, feeds):
     if type(offset) is not int or offset < 0:
         raise ValueError("Use an offset returned by the previous read.")
     if not isinstance(url, str):
         return {"status": "unavailable"}
     permanent = re.fullmatch(r"https://starcitizen\.tools/index\.php\?oldid=([1-9][0-9]{0,17})", url or "")
     selected = _selected(url, include_star_citizen, roots)
+    if feeds and url.startswith("https://"):
+        for feed, path in _api_libraries(community_db_path(db_path), feeds):
+            item = read_snapshot_page(path, url, offset)
+            if item["status"] != "not_found":
+                return {**item, "source_kind": "game_api", "api_source": feed.url, "citation": item["url"]}
     if not selected and not (include_star_citizen and permanent):
         return {"status": "unavailable"}
     if selected:
@@ -173,13 +214,20 @@ def read_page(db_path, url, *, offset=0, include_star_citizen=True, roots=()):
     return read_web_page(community_db_path(db_path), url, roots, offset=offset)
 
 
-def check_inventory(db_path, manifest, *, include_star_citizen=True, roots=(), queue_missing=False):
+def check_inventory(db_path, manifest, *, include_star_citizen=True, roots=(), queue_missing=False, feeds=()):
     path = community_db_path(db_path)
-    return verify_inventory(path, manifest, lambda url: _selected(url, include_star_citizen, roots),
+    api_pages = {}
+    for _, api_path in _api_libraries(path, feeds):
+        for url, revisions in full_pages(api_path).items():
+            api_pages.setdefault(url, set()).update(revisions)
+    origins = {urlsplit(feed.url).netloc for feed in feeds}
+    return verify_inventory(path, manifest,
+                            lambda url: url in api_pages or urlsplit(url).netloc in origins or _selected(url, include_star_citizen, roots),
+                            additional_pages=api_pages,
                             queue_undiscovered=(lambda urls: queue_inventory_urls(path, roots, urls)) if queue_missing else None)
 
 
-def library_status(db_path=None, *, include_star_citizen=True, roots=()):
+def library_status(db_path=None, *, include_star_citizen=True, roots=(), feeds=()):
     path = community_db_path(db_path)
     allowed = lambda url: _selected(url, include_star_citizen, roots)
     full = full_pages(path)
@@ -310,10 +358,15 @@ def library_status(db_path=None, *, include_star_citizen=True, roots=()):
             "across all selected sources (see imported_articles by origin). Private notes are excluded "
             "from coverage totals."
         )
+    if feeds:
+        states = {feed.url: api_status(path, feed) for feed in feeds}
+        status["game_apis"] = states
+        available = sum(bool(s.get("readable")) for s in states.values())
+        status["coverage_summary"] += f" Game APIs ready to read offline: {available} of {len(states)}."
     return status
 
 
-def lookup(guides: Path, query: str, game_build=None, db_path=None, *, include_star_citizen=True, roots=()):
+def lookup(guides: Path, query: str, game_build=None, db_path=None, *, include_star_citizen=True, roots=(), feeds=()):
     db_path = community_db_path(db_path)
     curated = WikiReference.search_curated(guides, query, game_build=game_build) if include_star_citizen else {}
     terms = _query_terms(query)
@@ -338,6 +391,10 @@ def lookup(guides: Path, query: str, game_build=None, db_path=None, *, include_s
     web = search_web_sources(query, db_path, roots) if roots and game_build is None else []
     references = curated.get("references", []) + notes + manual + articles + web + cached
     _source_changes(references, db_path)
+    for feed, path in _api_libraries(db_path, feeds):
+        _source_changes(notes, path)
+        for item in search_snapshots(query, path, game_build=game_build):
+            references.append({**item, "source_kind": "game_api", "api_source": feed.url, "citation": item["url"]})
     return {"status": "reference" if references else "no_matching_evidence",
             "references": references, "live_state": False,
             "discovery_links": [] if references or game_build is not None or not include_star_citizen else

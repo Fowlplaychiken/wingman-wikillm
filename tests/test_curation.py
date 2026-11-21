@@ -1,7 +1,9 @@
 import asyncio
+import json
 import importlib.util
 from pathlib import Path
 import sys
+import tempfile
 from types import ModuleType, SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
@@ -54,6 +56,52 @@ def _load_main_module():
 
 
 class CurationTests:
+    def test_native_tool_choices_and_one_publisher_status_after_reopen(self):
+        module = _load_main_module()
+        with tempfile.TemporaryDirectory() as directory:
+            db = Path(directory) / "my.sqlite3"
+            with patch.object(module, "community_db_path", return_value=db), patch.object(module, "RefreshScheduler"):
+                skill = module.WingmanWikiLLM()
+                skill.config.prompt = None
+                asyncio.run(skill.prepare())
+                self.assertIn("one short sentence", asyncio.run(skill.get_prompt()))
+                self.assertEqual(json.loads(asyncio.run(skill.wiki_sources("add", "wiki.example.org")))["wiki_count"], 1)
+                self.assertEqual(json.loads(asyncio.run(skill.wiki_sources("pause", "wiki.example.org")))["wiki_count"], 0)
+                reopened = module.WingmanWikiLLM()
+                asyncio.run(reopened.prepare())
+                self.assertFalse(json.loads(asyncio.run(reopened.wiki_sources("list")))["sources"][0]["enabled"])
+                self.assertEqual(json.loads(asyncio.run(reopened.wiki_sources("resume", "wiki.example.org")))["wiki_count"], 1)
+                with patch.object(module, "library_status", return_value={
+                    "galactapedia_feed": {"titles": 9, "article_bodies": 8, "placeholders": 1, "missing": 0, "last_success": 1},
+                    "star_citizen_library": {"community": {"titles": 99}},
+                }):
+                    lore = json.loads(asyncio.run(reopened.wiki_library_status("galactapedia")))
+                    self.assertEqual(lore["english_articles"], 8)
+                    self.assertNotIn("community", lore)
+                    self.assertEqual(json.loads(asyncio.run(reopened.wiki_library_status("community")))["coverage"]["titles"], 99)
+
+    def test_game_api_is_optional_and_remains_readable_with_updates_paused(self):
+        module = _load_main_module()
+        skill = module.WingmanWikiLLM()
+        url = "https://api.example.org/game/conditions"
+        skill.properties.update({"include_star_citizen": False, "api_sources": url})
+        for online in (True, False):
+            skill.properties["auto_refresh"] = online
+            with patch.object(module, "RefreshScheduler") as scheduler:
+                asyncio.run(skill.prepare())
+            self.assertEqual([f.url for f in skill._feeds], [url])
+            self.assertEqual([f.url for f in scheduler.call_args.kwargs["feeds"]], [url] if online else [])
+            self.assertFalse(scheduler.call_args.kwargs["sync_galactapedia"])
+        skill.properties["api_sources"] = "# " + url
+        with patch.object(module, "RefreshScheduler"):
+            asyncio.run(skill.prepare())
+        self.assertFalse(skill._feeds)
+        skill.properties["api_sources"] = "invalid\n" + url
+        with patch.object(module, "RefreshScheduler"):
+            asyncio.run(skill.prepare())
+        self.assertEqual([f.url for f in skill._feeds], [url])
+        self.assertIn("line 1", skill._source_errors[0])
+
     def test_galactapedia_refresh_respects_online_game_and_source_switches(self):
         module = _load_main_module()
         for settings in ({}, {"include_star_citizen": False}, {"auto_refresh": False},

@@ -62,10 +62,14 @@ class RefreshReport:
     sources: dict = field(default_factory=dict)
 
     def building_library(self):
+        if any(feed.get("status") == "building" for feed in self.sources.get("apis", {}).values()):
+            return True
         community = self.coverage.get("community", {})
         if self.indexed and community.get("catalog_urls", 0) > community.get("indexed_pages", 0):
             return True
         wikis = self.sources.get("wikis", {})
+        if any(root.get("api", {}).get("more_pages") for root in wikis.get("roots", {}).values()):
+            return True
         return bool(wikis.get("indexed") and any(
             source.get("pages", {}).get("pending") for source in wikis.get("coverage", {}).values()))
 
@@ -277,7 +281,7 @@ def refresh_once(db_path: str | Path, *, batch_size: int = 5,
                  catalog_interval: float = 86_400, page_interval: float = 604_800,
                  publisher=None, stop_event: threading.Event | None = None,
                  clock=time.time, enabled_catalogs=None, roots=(), import_snapshots=False,
-                 include_sc_edition=False, sync_galactapedia=False) -> RefreshReport:
+                 include_sc_edition=False, sync_galactapedia=False, feeds=(), feed_interval=86_400) -> RefreshReport:
     """One leased refresh for a per-user DB; stale lease recovers after 120 s.
 
     A small heartbeat renews during bounded network reads. Losing the lease
@@ -289,7 +293,7 @@ def refresh_once(db_path: str | Path, *, batch_size: int = 5,
     path = Path(db_path).expanduser()
     from .snapshots import bundled_edition, sync_snapshots
     edition = bundled_edition() if include_sc_edition and import_snapshots else None
-    if not enabled and not roots and not sync_galactapedia and import_snapshots and edition is None and not (path.parent / "snapshots").exists():
+    if not enabled and not roots and not feeds and not sync_galactapedia and import_snapshots and edition is None and not (path.parent / "snapshots").exists():
         return RefreshReport()
     path.parent.mkdir(parents=True, exist_ok=True)
     token = uuid.uuid4().hex
@@ -345,6 +349,18 @@ def refresh_once(db_path: str | Path, *, batch_size: int = 5,
             except Exception as exc:
                 report.sources["wikis"] = {"status": "failed", "error_type": type(exc).__name__}
                 report.failed += 1
+        if feeds and not cancellation.is_set():
+            from .json_feeds import refresh_feeds
+            try:
+                report.sources["apis"] = refresh_feeds(path, feeds, stop_event=cancellation, clock=clock,
+                                                       interval=feed_interval)
+                report.failed += sum(result.get("status") in {"failed", "error"} for result in report.sources["apis"].values())
+            except corpus.RefreshCancelled:
+                report.cancelled = True
+            except (ValueError, OSError, sqlite3.Error) as exc:
+                report.sources["apis"] = {feed.url: {"status": "failed", "error_type": type(exc).__name__}
+                                          for feed in feeds}
+                report.failed += 1
         if import_snapshots and not cancellation.is_set():
             try:
                 report.sources["imports"] = sync_snapshots(path, packaged_edition=edition, **snapshot_limits())
@@ -367,13 +383,17 @@ class RefreshScheduler:
     stop() interrupts pacing immediately. An active HTTP request may take its
     existing 15 second timeout; False means the worker has not stopped yet.
     """
-    def __init__(self, db_path, *, interval=3600, catch_up=False, **refresh_options):
+    def __init__(self, db_path, *, interval=3600, catch_up=False, source_provider=None, **refresh_options):
         if type(interval) not in (int, float) or not 60 <= interval <= 31_536_000:
             raise ValueError("scheduler interval must be 60 seconds..1 year")
         if "stop_event" in refresh_options:
             raise ValueError("scheduler owns its cancellation event")
+        if source_provider or refresh_options.get("feeds"):
+            refresh_options.setdefault("feed_interval", interval)
         self.db_path, self.interval, self.options = db_path, interval, refresh_options
         self.catch_up = catch_up
+        self.source_provider = source_provider
+        self._wake = threading.Event()
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._thread = None
@@ -392,12 +412,15 @@ class RefreshScheduler:
     def _work(self):
         next_import = 0.0
         while not self._stop.is_set():
+            self._wake.clear()
             delay = self.interval
             try:
                 options = self.options.copy()
+                if self.source_provider:
+                    options["roots"], options["feeds"] = self.source_provider()
                 if options.get("import_snapshots"):
                     options["import_snapshots"] = time.monotonic() >= next_import
-                self.last_report = refresh_once(self.db_path, stop_event=self._stop, **options)
+                self.last_report = refresh_once(self.db_path, stop_event=_Cancellation(self._stop, self._wake), **options)
                 if "imports" in self.last_report.sources:
                     next_import = time.monotonic() + self.interval
                 if self.catch_up and self.last_report.building_library():
@@ -405,12 +428,16 @@ class RefreshScheduler:
                 self.last_error = None
             except Exception as exc:
                 self.last_error = type(exc).__name__
-            if self._stop.wait(delay):
-                break
+            if not self._stop.is_set():
+                self._wake.wait(delay)
+
+    def sources_changed(self):
+        self._wake.set()
 
     def stop(self, timeout=0):
         with self._lock:
             self._stop.set()
+            self._wake.set()
             thread = self._thread
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout)

@@ -14,13 +14,14 @@ FILES = (
     "dependencies/wingman_wiki/refresh.py", "dependencies/wingman_wiki/web_sources.py",
     "dependencies/wingman_wiki/snapshots.py", "dependencies/wingman_wiki/sc_archive.py",
     "dependencies/wingman_wiki/coverage.py", "dependencies/wingman_wiki/galactapedia_feed.py",
-    "guides/README.md",
+    "dependencies/wingman_wiki/json_feeds.py", "dependencies/wingman_wiki/source_choices.py", "guides/README.md",
     "guides/environmental-indicators.md", "guides/engineering-displays.md",
     "guides/getting-started-flight.md", "guides/industrial-careers.md",
     "guides/missions-survival-exploration.md", "guides/wingman-modules.md",
 )
 # Repository-owned binary assets are deliberately separate from UTF-8 sources.
 BINARY_FILES = ("docs/field-guide.webp",)
+DOCUMENTS = ("README.md", "LICENSE", "docs/sources.md")
 
 
 def package_members(version):
@@ -32,7 +33,7 @@ def package_members(version):
         if name in {"main.py", "__main__.py"}:
             content = content.replace("wingman_wiki.", namespace + ".")
         members[name.replace("dependencies/wingman_wiki/", f"dependencies/{namespace}/")] = content.encode()
-    for name in ("LICENSE", "README.md"):
+    for name in DOCUMENTS:
         members[name] = (ROOT / name).read_text(encoding="utf-8").encode()
     for name in BINARY_FILES:
         members[name] = (ROOT / name).read_bytes()

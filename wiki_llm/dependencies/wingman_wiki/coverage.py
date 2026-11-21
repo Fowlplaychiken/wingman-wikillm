@@ -58,9 +58,11 @@ def renamed_articles(db_path, requested=None):
     return aliases
 
 
-def verify_inventory(db_path, manifest, allowed, *, queue_undiscovered=None):
+def verify_inventory(db_path, manifest, allowed, *, queue_undiscovered=None, additional_pages=None):
     """Check every expected URL and optional revision without contacting a wiki."""
     saved = full_pages(db_path)
+    for url, revisions in (additional_pages or {}).items():
+        saved.setdefault(url, set()).update(revisions)
     for old, current in renamed_articles(db_path).items():
         if current in saved:
             saved.setdefault(old, set()).update(saved[current])
