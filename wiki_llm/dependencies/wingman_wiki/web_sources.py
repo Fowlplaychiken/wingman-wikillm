@@ -431,6 +431,7 @@ class _Page(HTMLParser):
         self.edit_uri = None
         self.no_full_text = False
         self.complete = False
+        self.incomplete = False
         self.seen_html = False
         self.follow = True
         self.feed(body)
@@ -512,13 +513,19 @@ class _Page(HTMLParser):
     def handle_endtag(self, tag):
         if tag == "p":
             self._flush_paragraph()
-        if tag == "html" or not self.seen_html and tag in {"article", "main"}:
-            self.complete = True
         if tag in {"p", "li", "h1", "h2", "h3", "h4", "dt", "dd", "pre", "td", "article", "main"}:
             self._flush()
+        if tag in {"body", "html"}:
+            # Do not let a closing document tag hide unclosed article/main
+            # containers that indicate the response was truncated.
+            self.incomplete |= any(item[0] in {"article", "main"} for item in self.stack)
+            if tag == "html":
+                self.complete = not self.incomplete
         index = next((i for i in range(len(self.stack)-1, -1, -1) if self.stack[i][0] == tag), None)
         if index is not None:
             del self.stack[index:]
+        if not self.seen_html and tag in {"article", "main"}:
+            self.complete = not self.incomplete and not any(item[0] in {"article", "main"} for item in self.stack)
 
     def handle_data(self, data):
         if self.stack and not self.stack[-1][1]:
@@ -747,6 +754,7 @@ def refresh_web_sources(db_path, roots, *, batch_size=5, stop_event=None,
                         with db:
                             if old_status != "removed":
                                 corpus.record_source_change(db, url, observed, "web_page_removed")
+                            _purge(db, root, url, "removed")
                             db.execute("UPDATE web_pages SET status='removed',retrieved_at=?,next_attempt=?,last_error=NULL WHERE root=? AND url=?", (observed, now+604_800, root, url))
                         continue
                     if response.status == 304 and old_hash and old_status == "indexed":

@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Literal, Optional
 
 from skills.skill_base import Skill, tool
-from wingman_wiki.library import library_status, lookup, note_history, read_page, record_note
+from wingman_wiki.library import library_status, lookup, note_history, read_page, record_note, review_queue
 from wingman_wiki.reference import community_db_path
 from wingman_wiki.refresh import RefreshScheduler
 from wingman_wiki.web_sources import parse_roots
@@ -22,15 +22,16 @@ class WingmanWikiLLM(Skill):
             return default if value is None else value
         self._sc = setting("include_star_citizen", True)
         self._roots = parse_roots(setting("wiki_sources", ""))
-        if setting("auto_refresh", True):
-            pages = setting("pages_per_update", 5)
-            if isinstance(pages, bool) or int(pages) != pages or not 1 <= pages <= 100:
-                raise ValueError("Choose 1 to 100 pages per batch.")
-            self._refresh = RefreshScheduler(community_db_path(), interval=setting("refresh_interval_hours", 1)*3600,
-                                             catch_up=setting("catch_up", True), batch_size=int(pages),
-                                             enabled_catalogs=None if self._sc else (),
-                                             roots=self._roots, import_snapshots=True)
-            self._refresh.start()
+        online = setting("auto_refresh", True)
+        pages = setting("pages_per_update", 5)
+        if isinstance(pages, bool) or int(pages) != pages or not 1 <= pages <= 100:
+            raise ValueError("Choose 1 to 100 pages per batch.")
+        self._refresh = RefreshScheduler(
+            community_db_path(), interval=setting("refresh_interval_hours", 1)*3600,
+            catch_up=setting("catch_up", True), batch_size=int(pages),
+            enabled_catalogs=None if online and self._sc else (),
+            roots=self._roots if online else (), import_snapshots=True)
+        self._refresh.start()
 
     async def unload(self):
         scheduler = getattr(self, "_refresh", None)
@@ -111,3 +112,12 @@ class WingmanWikiLLM(Skill):
             before: Read earlier revisions below this number.
         """
         return json.dumps(await asyncio.to_thread(note_history, slug, before=before), ensure_ascii=False)
+
+    @tool(name="wikillm_review_queue", description="Find private drafts and notes whose cited source has changed. Read the note history and check the evidence before making a revision.", summarize=False)
+    async def wiki_review_queue(self, after: Optional[str] = None) -> str:
+        """Find notes needing review without using the internet.
+
+        Args:
+            after: Use next_after from the previous page to continue.
+        """
+        return json.dumps(await asyncio.to_thread(review_queue, after=after), ensure_ascii=False)

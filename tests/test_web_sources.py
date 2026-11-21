@@ -137,6 +137,8 @@ def test_added_renamed_removed_recovered_pages_and_stable_change_observation(tmp
     with sqlite3.connect(db) as conn:
         changes = dict(conn.execute('SELECT url,reason FROM source_changes'))
         assert changes == {A: 'web_page_changed', old: 'web_url_redirected', gone: 'web_page_removed'}
+        assert conn.execute('SELECT storage_mode FROM web_pages WHERE url=?', (gone,)).fetchone() == (None,)
+        assert conn.execute('SELECT count(*) FROM web_passages WHERE url=?', (gone,)).fetchone() == (0,)
         first = conn.execute('SELECT * FROM source_changes ORDER BY url').fetchall()
         assert conn.execute('SELECT * FROM note_revisions').fetchall() == notes
     source.now += 604_801
@@ -172,6 +174,20 @@ def test_failure_or_incomplete_read_retains_good_and_toggle_makes_zero_calls(tmp
     source.pages[A] = html('Durable evidence')
     assert source.run(db)['indexed'] == 1
     assert not web.search_web_sources('Durable', db, (A,))[0]['needs_review']
+
+
+def test_closed_html_does_not_make_truncated_custom_article_complete(tmp_path):
+    source, db = Fixture(), tmp_path / 'wiki.sqlite3'
+    source.pages[A] = html('Durable article')
+    source.run(db)
+    source.now += 604_801
+    source.pages[A] = (b'<html><body><article><p>Truncated replacement contains enough words and characters '
+                       b'to pass the minimum text check but never closes the article.</p></body></html>')
+
+    report = source.run(db)
+
+    assert report['failed'] == 1
+    assert web.search_web_sources('Durable article', db, (A,))[0]['needs_review']
 
 
 def test_nested_sitemaps_are_hints_and_partial_failure_does_not_delete(tmp_path):

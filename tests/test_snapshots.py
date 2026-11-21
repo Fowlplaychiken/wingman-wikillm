@@ -144,6 +144,31 @@ class SnapshotTests(unittest.TestCase):
                 import_snapshot(db, source)
         assert search_snapshots("words", db) == []
 
+    def test_blank_jsonl_text_is_rejected_and_legacy_blank_rows_are_not_coverage(self):
+        from wiki_llm.dependencies.wingman_wiki.coverage import full_pages
+        from wiki_llm.dependencies.wingman_wiki.library import library_status
+
+        tmp_path = self.tmp_path
+        db = tmp_path / "db.sqlite3"
+        source = tmp_path / "blank.jsonl"
+        for body in ("", " \t\n"):
+            source.write_text(json.dumps({"url": "https://lore.example.org/article",
+                                          "title": "Article", "text": body}) + "\n",
+                              encoding="utf-8")
+            with self.assertRaises(SnapshotError):
+                import_snapshot(db, source)
+
+        with closing(sqlite3.connect(db)) as connection:
+            connection.execute("""INSERT INTO snapshot_pages(
+                source_id,page_key,url,source_origin,title,body,revision,links_json)
+                VALUES(?,?,?,?,?,?,?,?)""",
+                ("legacy", "legacy-page", "https://lore.example.org/article",
+                 "https://lore.example.org", "Article", " \t\n", "4", "[]"))
+            connection.commit()
+        self.assertEqual(full_pages(db), {})
+        status = library_status(db, include_star_citizen=False, roots=("https://lore.example.org/",))
+        self.assertEqual(status["imported_articles"], [])
+
 
     def test_failed_or_truncated_reimport_preserves_last_good_and_change_log(self):
         tmp_path = self.tmp_path
@@ -243,6 +268,31 @@ class SnapshotTests(unittest.TestCase):
         assert result["status"] == "synced"
         assert [source["file"] for source in result["sources"]] == ["a.jsonl"]
         assert search_snapshots("starlight", db)[0]["url"] == "https://data.example.org/article"
+
+    def test_sync_preserves_imports_when_export_files_are_missing(self):
+        tmp_path = self.tmp_path
+        db = tmp_path / "user" / "wiki.sqlite3"
+        source_dir = db.parent / "snapshots"
+        source_dir.mkdir(parents=True)
+        synced = source_dir / "managed.jsonl"
+        external = tmp_path / "external.jsonl"
+        synced.write_text(json.dumps({"url": "https://data.example.org/managed",
+                                      "title": "Managed", "text": "managedtoken"}) + "\n",
+                          encoding="utf-8")
+        external.write_text(json.dumps({"url": "https://data.example.org/external",
+                                        "title": "External", "text": "externaltoken"}) + "\n",
+                           encoding="utf-8")
+        sync_snapshots(db)
+        import_snapshot(db, external)
+
+        synced.unlink()
+        result = sync_snapshots(db)
+
+        assert result["sources"] == []
+        assert search_snapshots("managedtoken", db)
+        assert search_snapshots("externaltoken", db)
+        with closing(sqlite3.connect(db)) as connection:
+            assert connection.execute("SELECT count(*) FROM source_changes").fetchone()[0] == 0
 
     def test_gzip_and_bzip2_exports_stream_into_snapshots(self):
         tmp_path = self.tmp_path

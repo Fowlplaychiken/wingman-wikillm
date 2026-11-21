@@ -167,6 +167,26 @@ def test_scheduler_single_worker_and_bounded_stop(tmp_path):
         assert call.call_count == 1 and worker.last_report.cancelled
 
 
+def test_offline_refresh_picks_up_new_and_replaced_exports_without_contacting_publishers(tmp_path):
+    from wiki_llm.dependencies.wingman_wiki.library import read_page
+    path = tmp_path / "wiki.sqlite3"
+    root = "https://example.org/game/"
+    url = root + "Engine"
+    options = {"enabled_catalogs": (), "roots": (), "import_snapshots": True}
+    with patch("socket.socket", side_effect=AssertionError("network access")):
+        assert not refresh.refresh_once(path, **options).failed
+        assert not path.exists()
+        source = tmp_path / "snapshots" / "game.jsonl"
+        source.parent.mkdir()
+        for revision, text in enumerate(("First description", "Revised description"), 1):
+            source.write_text(json.dumps(dict(url=url, title="Engine", revision=revision, text=text)),
+                              encoding="utf-8")
+            report = refresh.refresh_once(path, **options)
+            assert not report.failed and report.sources["imports"]["sources"]
+            result = read_page(path, url, include_star_citizen=False, roots=(root,))
+            assert result["text"] == text
+
+
 def test_new_publisher_instance_inherits_database_pacing(tmp_path):
     from urllib.parse import urlsplit
     class Tracking(corpus.Publisher):

@@ -392,7 +392,7 @@ def _jsonl_pages(stream, insert_page, max_pages: int | None):
         title, body = article.get("title"), article.get("text")
         if not isinstance(title, str) or not title.strip() or len(title) > 500:
             raise SnapshotError(f"JSONL line {line_number} has an invalid title")
-        if not isinstance(body, str) or len(body) > MAX_PAGE_CHARS:
+        if not isinstance(body, str) or not body.strip() or len(body) > MAX_PAGE_CHARS:
             raise SnapshotError(f"JSONL line {line_number} has invalid or oversized article text")
         revision = article.get("revision")
         if revision is not None and type(revision) not in (str, int):
