@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 from .dependencies.wingman_wiki.library import check_inventory, library_status, lookup, note_history, read_page, review_queue
+from .dependencies.wingman_wiki.json_feeds import parse_feeds
 from .dependencies.wingman_wiki.reference import community_db_path
 from .dependencies.wingman_wiki.refresh import refresh_once, snapshot_limits
 from .dependencies.wingman_wiki.snapshots import import_snapshot
@@ -15,6 +16,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", type=Path, help="Use another local wiki database")
     parser.add_argument("--wiki", action="append", default=[], help="Enable a wiki home URL (repeatable)")
+    parser.add_argument("--api", action="append", default=[], help="Enable a public JSON collection URL or a JSON field mapping (repeatable)")
     parser.add_argument("--no-sc", action="store_true", help="Turn off the Star Citizen preset for this command")
     commands = parser.add_subparsers(dest="command", required=True)
     search = commands.add_parser("lookup", help="Find cited local evidence")
@@ -42,13 +44,14 @@ def main():
     db = community_db_path(args.db)
     try:
         roots = parse_roots("\n".join(args.wiki))
-        options = {"include_star_citizen": not args.no_sc, "roots": roots}
+        feeds = parse_feeds("\n".join(args.api))
+        options = {"include_star_citizen": not args.no_sc, "roots": roots, "feeds": feeds}
         if args.command == "lookup":
             result = lookup(Path(__file__).with_name("guides"), args.query, args.build, db, **options)
         elif args.command == "history":
             result = note_history(args.topic, db, args.before)
         elif args.command == "review":
-            result = review_queue(db, after=args.after)
+            result = review_queue(db, after=args.after, feeds=feeds)
         elif args.command == "read":
             result = read_page(db, args.url, offset=args.offset, **options)
         elif args.command == "status":
@@ -59,7 +62,7 @@ def main():
             result = import_snapshot(db, args.path, **snapshot_limits())
         else:
             result = asdict(refresh_once(db, batch_size=args.batch_size, enabled_catalogs=() if args.no_sc else None,
-                                         roots=roots, import_snapshots=True,
+                                         roots=roots, feeds=feeds, import_snapshots=True,
                                          include_sc_edition=not args.no_sc,
                                          sync_galactapedia=not (args.no_sc or args.no_galactapedia)))
     except (OSError, ValueError) as exc:

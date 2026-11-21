@@ -10,7 +10,7 @@ Ask your Wingman a Star Citizen question by voice, get a link to the original ar
 
 1. Download the `wiki_llm-*.zip` release asset. Extract the **wiki_llm** folder into Wingman’s custom skills folder. On Windows, paste `%APPDATA%\ShipBit\WingmanAI\custom_skills` into File Explorer.
 2. Reopen Wingman and enable **WikiLLM** for your assistant. If the skill doesn’t appear, check that `default_config.yaml` sits directly inside `custom_skills/wiki_llm/`.
-3. Try **“Use my wiki. Why is it hard to see when driving on Aberdeen?”** This works immediately from the starter guides. Aberdeen’s sulfurous haze limits visibility. [CIG Galactapedia](https://robertsspaceindustries.com/galactapedia/article/0qanJarxqa-aberdeen-stanton-1b) · [Star Citizen Wiki](https://starcitizen.tools/Aberdeen)
+3. Try **“Why’s it so hard to see on Aberdeen?”** Your Wingman can answer from the starter guides: “Sulfurous haze cuts visibility on the surface.” Ask for a longer briefing if you want one. [CIG Galactapedia](https://robertsspaceindustries.com/galactapedia/article/0qanJarxqa-aberdeen-stanton-1b) · [Star Citizen Wiki](https://starcitizen.tools/Aberdeen)
 
 ## Choose your games
 
@@ -20,12 +20,30 @@ Open **WikiLLM’s skill settings** in Wingman.
 | --- | --- |
 | Star Citizen | Leave **Use the Star Citizen library** on. |
 | Another game too | Paste its public wiki home address into **Other game wikis**, one HTTPS URL per line. |
+| A game data API | Paste its public JSON collection URL into **Other game APIs**, one per line. You can use an API and a wiki together. |
 | Only another game | Add its address and turn **Use the Star Citizen library** off. |
 | A particular section | Use its directory URL ending in `/`, such as `https://wiki.openttd.org/en/Manual/`. |
 | Pause one wiki | Put `#` before its address and save. Remove `#` to show its saved pages and resume updates. |
 | No internet access from the skill | Turn **Check online wikis for updates** off. You can still add or replace a local export. |
 
 Ask **“How much of my wiki is available offline?”** to see what the library contains. WikiLLM follows section menus, article links and sitemaps. On compatible MediaWiki sites it also asks for the publisher’s article list to find unlinked pages. Each pass resumes from its saved position.
+
+### Add a game API
+
+Start with the collection URL from the publisher’s API documentation. If each record has a title, text and a link, the address alone can be enough. WikiLLM checks robots.txt, follows the next-page address in the JSON or HTTP Link header, and saves the records locally. Put `#` before a line to pause it.
+
+<details>
+<summary>When the API uses different field names</summary>
+
+Paste one JSON mapping on a single line in **Other game APIs**. This example uses Open5e’s conditions collection. [Open5e API documentation](https://open5e.com/api-docs)
+
+```json
+{"url":"https://api.open5e.com/v2/conditions/?document__key=a5e-ag","items":"results","title":"name","text":"descriptions.0.desc","id_field":"key","url_template":"https://api.open5e.com/v2/conditions/{id}/","next":"next","total":"count"}
+```
+
+`items` locates the list of records. `title` and `text` locate fields within each record. Use `url_field` for the publisher’s article link or build it from a stable ID as above. `next` locates the next page and `total` lets WikiLLM check the final count. Use a public read-only JSON endpoint that permits offline use. Entering a website home page belongs under **Other game wikis**.
+
+</details>
 
 ## What can it answer offline?
 
@@ -43,7 +61,7 @@ Questions search the local index. Opening a publisher link uses the internet. Fo
 
 Describe something you observed in the game. With **Automatically draft game notes** on, your usual conversation model can save a private draft during that turn. You can also say **“Save this as a draft field note.”** Turn the setting off if you prefer to ask each time.
 
-Ask **“Which of my notes need review?”** to see drafts and notes whose sources have changed. Once you’ve checked the evidence, ask Wingman to mark a note reviewed. You can correct it later, see its history or withdraw it. Background source updates use no model tokens.
+If you later confirm a finding or correct it, your Wingman can update the existing note. A reviewed note linked to an article appears alongside that article in your local library. A publisher update preserves the note and flags a changed citation for review. Ask **“Which of my notes about Aberdeen need review?”** to revisit a topic. You can see its history or withdraw it. Background source updates use no model tokens.
 
 Wingmen under the same computer user account share the library. Other players start with their own notes. If you use a hosted conversation model, Wingman can send it the retrieved passages, including a matching private note. Choose a local conversation model if you want that exchange to stay on your hardware.
 
@@ -78,12 +96,13 @@ python -m wiki_llm lookup "life support load" --build 4.10.3
 python -m wiki_llm --no-sc --wiki https://wiki.openttd.org/en/Manual/ refresh
 python -m wiki_llm --no-sc --wiki https://wiki.openttd.org/en/Manual/ status
 python -m wiki_llm --no-sc --wiki https://wiki.openttd.org/en/Manual/ lookup "railways"
+python -m wiki_llm --no-sc --api https://example.org/game/articles.json refresh
 python -m wiki_llm import game-wiki.xml
 python -m wiki_llm review
 python -m wiki_llm --no-sc --wiki https://wiki.wesnoth.org/ verify publisher-inventory.jsonl --queue-missing
 ```
 
-These commands return JSON. Supply `--wiki` once per enabled address on each command. A lookup or page read stays offline. A refresh contacts enabled publishers. For JSONL exports, use one object per line with `url`, `title` and `text`. You can also supply `revision` and `game_build`. The optional inventory check compares every listed `url` and, when provided, its exact `revision` against saved article text. Use a current publisher list independent of the crawl. An excerpt cannot pass this check. Use `--db` or `SC_WIKI_DB` to choose another database.
+These commands return JSON. Supply `--wiki` or `--api` once per enabled source on each command. Replace the example API address with your collection URL or pass the same JSON mapping you would enter in Wingman. A lookup or page read stays offline. A refresh contacts enabled publishers. For JSONL exports, use one object per line with `url`, `title` and `text`. You can also supply `revision` and `game_build`. The optional inventory check compares every listed `url` and, when provided, its exact `revision` against saved article text. Use a current publisher list independent of the crawl. An excerpt cannot pass this check. Use `--db` or `SC_WIKI_DB` to choose another database.
 
 Use `--queue-missing` with an inventory to add undiscovered URLs from your enabled custom wikis to the next refresh. Run the check again afterward to see which pages now have article text.
 

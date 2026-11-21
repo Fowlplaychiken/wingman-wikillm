@@ -367,9 +367,9 @@ def _payload(response, limit):
     return body
 
 
-def _transport(url, headers):
+def _transport(url, headers, *, validate_url=_network_url):
     """Pin the TLS connection to a validated public DNS result (no proxy/redirect)."""
-    parsed = urlsplit(_network_url(url))
+    parsed = urlsplit(validate_url(url))
     addresses = {item[4][0] for item in socket.getaddrinfo(parsed.hostname, 443, type=socket.SOCK_STREAM)}
     if not addresses or any(not ipaddress.ip_address(value).is_global for value in addresses):
         raise ValueError("Wiki DNS resolves to a non-public address")
@@ -384,7 +384,13 @@ def _transport(url, headers):
         body = response.read(limit + 1)
         if len(body) > limit:
             raise ValueError("Wiki response exceeds the bounded page size")
-        return Response(response.status, dict(response.getheaders()), body)
+        metadata = {}
+        for name, value in response.getheaders():
+            key = name.lower()
+            if key in metadata and key in {"link", "x-robots-tag", "cache-control", "content-signal"}:
+                value = metadata[key] + ", " + value
+            metadata[key] = value
+        return Response(response.status, metadata, body)
     finally:
         connection.close()
 

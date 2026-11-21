@@ -14,7 +14,7 @@ FILES = (
     "dependencies/wingman_wiki/refresh.py", "dependencies/wingman_wiki/web_sources.py",
     "dependencies/wingman_wiki/snapshots.py", "dependencies/wingman_wiki/sc_archive.py",
     "dependencies/wingman_wiki/coverage.py", "dependencies/wingman_wiki/galactapedia_feed.py",
-    "guides/README.md",
+    "dependencies/wingman_wiki/json_feeds.py", "guides/README.md",
     "guides/environmental-indicators.md", "guides/engineering-displays.md",
     "guides/getting-started-flight.md", "guides/industrial-careers.md",
     "guides/missions-survival-exploration.md", "guides/wingman-modules.md",

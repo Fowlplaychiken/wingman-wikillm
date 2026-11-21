@@ -14,6 +14,31 @@ GUIDES = Path(__file__).resolve().parents[1] / "wiki_llm" / "guides"
 
 
 class OfflineLibraryTests(unittest.TestCase):
+    def test_player_annotation_survives_publisher_revision_and_withdrawal(self):
+        from wiki_llm.dependencies.wingman_wiki.library import review_queue
+        from wiki_llm.dependencies.wingman_wiki.snapshots import import_snapshot
+        url = "https://example.org/wiki/Frost"
+        export = self.db.parent / "game.jsonl"
+        opts = {"include_star_citizen": False, "roots": ("https://example.org/wiki/",)}
+        def publish(body):
+            export.write_text(json.dumps({"url": url, "title": "Frost", "text": body}), encoding="utf-8")
+            import_snapshot(self.db, export)
+        publish("Cold slows travel.")
+        note = dict(slug="frost-pass", title="Frost Pass", finding="My rover crossed before dawn.",
+                    source=url + "#Travel", db_path=self.db)
+        record_note(**note, status="draft")
+        self.assertEqual([r["slug"] for r in review_queue(self.db, topic="frost")["notes"]], ["frost-pass"])
+        self.assertFalse(review_queue(self.db, topic="desert")["notes"])
+        self.assertNotIn("private_annotations", read_page(self.db, url, **opts))
+        record_note(**note, status="reviewed", previous_revision=1)
+        publish("Snow slows travel through the pass.")
+        page = read_page(self.db, url, **opts)
+        self.assertEqual(page["text"], "Snow slows travel through the pass.")
+        self.assertEqual(page["private_annotations"][0]["finding"], note["finding"])
+        self.assertTrue(page["private_annotations"][0]["needs_review"])
+        record_note(**note, status="withdrawn", previous_revision=2)
+        self.assertNotIn("private_annotations", read_page(self.db, url, **opts))
+
     def test_review_queue_finds_drafts_and_stale_citations_and_advances_after_review(self):
         from wiki_llm.dependencies.wingman_wiki.library import review_queue
         with patch.object(socket, "socket", side_effect=AssertionError("network access")):
@@ -40,6 +65,27 @@ class OfflineLibraryTests(unittest.TestCase):
         root = tempfile.TemporaryDirectory()
         self.addCleanup(root.cleanup)
         self.db = Path(root.name) / "wiki.sqlite3"
+
+    def test_only_an_enabled_readable_api_adds_offline_evidence(self):
+        from wiki_llm.dependencies.wingman_wiki.json_feeds import JsonFeed, feed_db_path
+        from wiki_llm.dependencies.wingman_wiki.snapshots import import_snapshot
+        feed = JsonFeed("https://api.example.org/v1/entries")
+        citation = "https://game.example.org/Iris"
+        export = self.db.parent / "api-records.jsonl"
+        export.write_text(json.dumps({"url": citation, "title": "Iris", "text": "A survey ship."}), encoding="utf-8")
+        import_snapshot(feed_db_path(self.db, feed), export)
+        inventory = self.db.parent / "titles.jsonl"
+        inventory.write_text(json.dumps({"url": citation}), encoding="utf-8")
+        opts = {"include_star_citizen": False, "feeds": (feed,)}
+        with patch("wiki_llm.dependencies.wingman_wiki.library.api_status", return_value={"readable": True, "articles": 1}), patch.object(socket, "socket", side_effect=AssertionError("network access")):
+            self.assertEqual(lookup(GUIDES, "Iris", db_path=self.db, **opts)["references"][0]["citation"], citation)
+            self.assertEqual(read_page(self.db, citation, **opts)["text"], "A survey ship.")
+            self.assertEqual(check_inventory(self.db, inventory, **opts)["present"], 1)
+            self.assertIn(feed.url, library_status(self.db, **opts)["game_apis"])
+            self.assertFalse(lookup(GUIDES, "Iris", db_path=self.db, include_star_citizen=False)["references"])
+        with patch("wiki_llm.dependencies.wingman_wiki.library.api_status", return_value={"readable": False, "articles": 0}):
+            self.assertEqual(read_page(self.db, citation, **opts)["status"], "unavailable")
+            self.assertFalse(lookup(GUIDES, "Iris", db_path=self.db, **opts)["references"])
 
     def test_renamed_galactapedia_article_keeps_old_citation_and_revision_checks(self):
         from wiki_llm.dependencies.wingman_wiki import corpus

@@ -54,6 +54,28 @@ def _load_main_module():
 
 
 class CurationTests:
+    def test_game_api_is_optional_and_remains_readable_with_updates_paused(self):
+        module = _load_main_module()
+        skill = module.WingmanWikiLLM()
+        url = "https://api.example.org/game/conditions"
+        skill.properties.update({"include_star_citizen": False, "api_sources": url})
+        for online in (True, False):
+            skill.properties["auto_refresh"] = online
+            with patch.object(module, "RefreshScheduler") as scheduler:
+                asyncio.run(skill.prepare())
+            self.assertEqual([f.url for f in skill._feeds], [url])
+            self.assertEqual([f.url for f in scheduler.call_args.kwargs["feeds"]], [url] if online else [])
+            self.assertFalse(scheduler.call_args.kwargs["sync_galactapedia"])
+        skill.properties["api_sources"] = "# " + url
+        with patch.object(module, "RefreshScheduler"):
+            asyncio.run(skill.prepare())
+        self.assertFalse(skill._feeds)
+        skill.properties["api_sources"] = "invalid\n" + url
+        with patch.object(module, "RefreshScheduler"):
+            asyncio.run(skill.prepare())
+        self.assertEqual([f.url for f in skill._feeds], [url])
+        self.assertIn("line 1", skill._api_setup_errors[0])
+
     def test_galactapedia_refresh_respects_online_game_and_source_switches(self):
         module = _load_main_module()
         for settings in ({}, {"include_star_citizen": False}, {"auto_refresh": False},

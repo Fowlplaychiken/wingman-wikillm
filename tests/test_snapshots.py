@@ -68,6 +68,16 @@ class SnapshotTests(unittest.TestCase):
             self.assertEqual((page["file_format"], page["text"]), ("jsonl", "Old turbine"))
             self.assertFalse(search_snapshots("thruster", db))
 
+    def test_a_named_subject_precedes_articles_that_mention_it(self):
+        db = self.tmp_path / "wiki.sqlite3"
+        src = self.tmp_path / "library.jsonl"
+        rows = [{"url": "https://wiki.example.org/Horizon", "title": "Horizon", "text": "The survey vessel."},
+                {"url": "https://wiki.example.org/Novel", "title": "Voyage",
+                 "text": "Horizon. Horizon. The novel mentions Horizon."}]
+        src.write_text("\n".join(map(json.dumps, rows)), encoding="utf-8")
+        import_snapshot(db, src)
+        self.assertEqual(search_snapshots(" HORIZON ", db)[0]["title"], "Horizon")
+
     def test_mediawiki_import_indexes_latest_revision_namespace_redirect_and_links(self):
         tmp_path = self.tmp_path
         source = tmp_path / "game.xml"
