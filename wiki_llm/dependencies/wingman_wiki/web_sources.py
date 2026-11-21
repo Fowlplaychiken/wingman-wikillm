@@ -44,6 +44,9 @@ CREATE TABLE IF NOT EXISTS web_cursor(id INTEGER PRIMARY KEY CHECK(id=1),last_ro
 CREATE TABLE IF NOT EXISTS web_sitemaps(root TEXT NOT NULL,url TEXT NOT NULL,
  next_attempt REAL NOT NULL DEFAULT 0,last_error TEXT,PRIMARY KEY(root,url));
 CREATE INDEX IF NOT EXISTS web_sitemaps_due ON web_sitemaps(root,next_attempt,url);
+CREATE TABLE IF NOT EXISTS web_sitemap_entries(root TEXT NOT NULL,sitemap TEXT NOT NULL,
+ url TEXT NOT NULL,stamp TEXT,PRIMARY KEY(root,sitemap,url));
+CREATE INDEX IF NOT EXISTS web_sitemap_article ON web_sitemap_entries(root,url);
 CREATE TABLE IF NOT EXISTS web_apis(root TEXT PRIMARY KEY,url TEXT NOT NULL,cursor TEXT,
  next_attempt REAL NOT NULL DEFAULT 0,last_success REAL,last_error TEXT);
 CREATE TABLE IF NOT EXISTS web_api_cursors(root TEXT NOT NULL,cursor TEXT NOT NULL,PRIMARY KEY(root,cursor));
@@ -55,6 +58,7 @@ _ADMIN = re.compile(r"(?:^|/)(?:admin|wp-admin|wp-login\.php|login|logout|api(?:
 _LICENSE = re.compile(r"^https?://(?:www\.)?creativecommons\.org/(?:licenses/(by|by-sa)/(\d\.\d)|publicdomain/zero/(1\.0))/?$", re.I)
 _ALLPAGES = {"action": "query", "format": "json", "list": "allpages", "apnamespace": "0",
              "aplimit": "50", "apfilterredir": "nonredirects"}
+_NAMESPACE_INFO = {"meta": "siteinfo", "siprop": "namespaces"}
 
 
 def _url(value):
@@ -105,12 +109,12 @@ def _url(value):
 
 
 def parse_roots(text) -> tuple[str, ...]:
-    """One public wiki base/home page per line; blank lines are ignored."""
+    """One public wiki per line. Prefix a line with # to pause it."""
     if not isinstance(text, str):
         raise ValueError("Supply a newline-separated wiki URL list")
     roots, seen = [], set()
     for line in text.splitlines():
-        if not line.strip():
+        if not line.strip() or line.lstrip().startswith("#"):
             continue
         url = _url(line.strip())
         if (_ADMIN.search(unquote(urlsplit(url).path)) or _ASSET.search(urlsplit(url).path)
@@ -164,7 +168,7 @@ def in_scope(url, root):
 
 
 def _network_url(url):
-    """Article queries or one fixed read-only API operation, never arbitrary actions."""
+    """Article queries or bounded allpages queries with optional namespace metadata."""
     try:
         return _url(url)
     except ValueError:
@@ -172,9 +176,13 @@ def _network_url(url):
         base = _url(urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", "")))
         pairs = parse_qsl(parsed.query, keep_blank_values=True, strict_parsing=True)
         fields = dict(pairs)
+        namespace = fields.get("apnamespace", "")
+        metadata = {k: fields[k] for k in _NAMESPACE_INFO if k in fields}
         if (len(url) > 6000 or not parsed.path.endswith("/api.php") or len(fields) != len(pairs)
-                or any(fields.get(key) != value for key, value in _ALLPAGES.items())
-                or set(fields) - _ALLPAGES.keys() - {"apcontinue", "continue"}
+                or any(fields.get(key) != value for key, value in {**_ALLPAGES, "apnamespace": namespace}.items())
+                or not re.fullmatch(r"0|[1-9][0-9]{0,9}", namespace) or int(namespace) > 2**31 - 1
+                or metadata not in ({}, _NAMESPACE_INFO)
+                or set(fields) - _ALLPAGES.keys() - _NAMESPACE_INFO.keys() - {"apcontinue", "continue"}
                 or any(len(fields.get(key, "")) > 1024 for key in ("apcontinue", "continue"))):
             raise ValueError("Unsupported wiki API request") from None
         return base + "?" + urlencode(fields)
@@ -210,14 +218,45 @@ def _register_api(db, root, edit_uri):
         db.execute("INSERT OR IGNORE INTO web_apis(root,url) VALUES(?,?)", (root, endpoint))
 
 
-def _title_url(root, title):
+def _title_url(root, title, endpoint=None):
     origin = urlsplit(root)
-    if origin.query:
-        candidate = urlunsplit((origin.scheme, origin.netloc, origin.path,
+    if origin.query or (endpoint and origin.path.endswith("/")):
+        path = origin.path if origin.query else urlsplit(urljoin(endpoint, "index.php")).path
+        candidate = urlunsplit((origin.scheme, origin.netloc, path,
                                urlencode({"title": title.replace(" ", "_")}, quote_via=quote, safe=":/"), ""))
     else:
-        candidate = urljoin(root, quote(title.replace(" ", "_"), safe=":/"))
+        # A custom namespace prefix (e.g. Item:) is part of the path, not a URI scheme.
+        candidate = urljoin(root, "./" + quote(title.replace(" ", "_"), safe=":/"))
     return _article(root, candidate)
+
+
+def _namespace_ids(metadata):
+    if not isinstance(metadata, dict) or not metadata:
+        return None
+    content = set()
+    for key, item in metadata.items():
+        if not isinstance(item, dict):
+            return None
+        ident = item.get("id")
+        if type(ident) is not int or str(ident) != key or abs(ident) > 2**31 - 1:
+            return None
+        # MediaWiki JSON format 1 encodes a true flag as an empty string.
+        if ident >= 0 and (item.get("content") is True or item.get("content") == ""):
+            content.add(ident)
+    return sorted(content | {0}) if content else None
+
+
+def _api_continuation(value):
+    if value is not None and (not isinstance(value, dict) or "apcontinue" not in value
+            or set(value) - {"continue", "apcontinue"}
+            or any(not isinstance(v, str) or not v or len(v) > 1024 for v in value.values())):
+        raise ValueError("Invalid wiki allpages continuation")
+    return value
+
+
+def _page_key(namespace, token):
+    # Keep pre-upgrade main-namespace cycle history usable.
+    return (f"{namespace}:" if namespace else "") + (json.dumps(token, sort_keys=True) if token else "")
 
 
 def _enumerate_api(db, contact, root, rules):
@@ -232,48 +271,78 @@ def _enumerate_api(db, contact, root, rules):
     endpoint, cursor, _ = row
     if _api_endpoint(root, endpoint) != endpoint:
         raise ValueError("Stored wiki API endpoint is outside this wiki family")
-    continuation = json.loads(cursor) if cursor else {}
-    request = endpoint + "?" + urlencode({**_ALLPAGES, **continuation})
+    saved = json.loads(cursor) if cursor else {}
+    discover = "remaining" not in saved
+    remaining = [0] if discover else saved["remaining"]
+    reason = None if discover else saved["reason"]
+    continuation = _api_continuation((saved if discover else saved["after"]) or None)
+    namespace = remaining[0]
+    query = {**_ALLPAGES, "apnamespace": str(namespace), **(continuation or {})}
+    request = endpoint + "?" + urlencode(query)
     _network_url(request)
     if not _allowed(rules, request):
+        reason = "robots_disallowed"
+        # A host-wide refusal, or the last blocked namespace, can resume from
+        # the same token if the publisher later permits it.
+        try_next = len(remaining) > 1 and _allowed(rules, endpoint)
+        next_cursor = json.dumps({"remaining": remaining[1:], "after": None, "reason": reason}) if try_next else cursor
         with db:
-            db.execute("UPDATE web_apis SET last_error='robots_disallowed',next_attempt=? WHERE root=?", (contact.clock()+86_400, root))
-        return {"state": "blocked", "reason": "robots_disallowed"}
+            db.execute("UPDATE web_apis SET last_error=?,cursor=?,next_attempt=? WHERE root=?",
+                       (reason, next_cursor, 0 if try_next else contact.clock()+86_400, root))
+        return {"state": "blocked", "reason": reason, "namespace": namespace, "complete": False}
+    if discover:
+        combined = endpoint + "?" + urlencode({**query, **_NAMESPACE_INFO})
+        if _allowed(rules, combined):
+            request = _network_url(combined)
+        else:
+            reason = "namespace_metadata_robots_disallowed"
     response = contact.get(request, rules=rules)
     if response.status != 200:
         raise ValueError("Declared wiki API unavailable")
     data = json.loads(_payload(response, 1_000_000).decode("utf-8-sig"))
+    error = data.get("error")
+    if isinstance(error, dict) and error.get("code") in ("ratelimited", "maxlag"):
+        until = corpus.retry_after(response.headers.get("retry-after", "900"), contact.clock())
+        with db:
+            db.execute("UPDATE web_hosts SET blocked_until=max(blocked_until,?) WHERE host=?",
+                       (until, urlsplit(endpoint).netloc))
+        raise _Cooldown(until)
     pages = data.get("query", {}).get("allpages")
     if data.get("error") or not isinstance(pages, list) or len(pages) > 50:
         raise ValueError("Incomplete wiki allpages batch")
+    if discover and reason is None:
+        declared = _namespace_ids(data["query"].get("namespaces"))
+        if declared is None:
+            reason = "namespace_metadata_unavailable"
+        else:
+            remaining = declared
     targets = []
     for page in pages:
-        if (not isinstance(page, dict) or type(page.get("ns")) is not int or page["ns"] != 0
+        if (not isinstance(page, dict) or type(page.get("ns")) is not int or page["ns"] != namespace
                 or type(page.get("pageid")) is not int or page["pageid"] <= 0
                 or not isinstance(page.get("title"), str) or not page["title"].strip()):
             raise ValueError("Invalid wiki allpages article identity")
-        target = _title_url(root, page["title"])
+        target = _title_url(root, page["title"], endpoint)
         if target:
             targets.append(target)
-    following = data.get("continue")
-    if following is not None and (not isinstance(following, dict) or not following
-            or "apcontinue" not in following or set(following) - {"continue", "apcontinue"}
-            or any(not isinstance(value, str) or not value or len(value) > 1024 for value in following.values())):
-        raise ValueError("Invalid wiki allpages continuation")
-    next_cursor = json.dumps(following, sort_keys=True) if following is not None else None
-    current_cursor = cursor or ""
-    if next_cursor == current_cursor or next_cursor and db.execute(
-            "SELECT 1 FROM web_api_cursors WHERE root=? AND cursor=?", (root, next_cursor)).fetchone():
+    following = _api_continuation(data.get("continue"))
+    current_key = _page_key(namespace, continuation)
+    if following and (following == continuation or db.execute(
+            "SELECT 1 FROM web_api_cursors WHERE root=? AND cursor=?", (root, _page_key(namespace, following))).fetchone()):
         raise ValueError("Wiki allpages continuation failed to advance")
+    if following is None:
+        remaining = remaining[1:]
+    next_cursor = json.dumps({"remaining": remaining, "after": following, "reason": reason}) if remaining else None
     with db:
         for target in targets:
             _queue(db, root, target)
-        db.execute("INSERT OR IGNORE INTO web_api_cursors VALUES(?,?)", (root, current_cursor))
-        db.execute("UPDATE web_apis SET cursor=?,next_attempt=?,last_success=?,last_error=NULL WHERE root=?",
-            (next_cursor, 0 if next_cursor else contact.clock()+86_400, contact.clock(), root))
+        db.execute("INSERT OR IGNORE INTO web_api_cursors VALUES(?,?)", (root, current_key))
+        db.execute("UPDATE web_apis SET cursor=?,next_attempt=?,last_success=?,last_error=? WHERE root=?",
+            (next_cursor, 0 if next_cursor else contact.clock()+86_400, contact.clock(), reason, root))
         if next_cursor is None:
             db.execute("DELETE FROM web_api_cursors WHERE root=?", (root,))
-    return {"state": "advanced", "discovered": len(targets), "complete": next_cursor is None}
+    return {"state": "advanced", "namespace": namespace, "discovered": len(targets),
+            "complete": next_cursor is None and reason is None, "reason": reason}
 
 
 @dataclass
@@ -310,8 +379,9 @@ def _transport(url, headers):
     try:
         connection.request("GET", (parsed.path or "/") + ("?" + parsed.query if parsed.query else ""), headers=headers)
         response = connection.getresponse()
-        body = response.read(4_000_001)
-        if len(body) > 4_000_000:
+        limit = corpus.SITEMAP_LIMIT if parsed.path.lower().endswith((".xml", ".xml.gz")) else 4_000_000
+        body = response.read(limit + 1)
+        if len(body) > limit:
             raise ValueError("Wiki response exceeds the bounded page size")
         return Response(response.status, dict(response.getheaders()), body)
     finally:
@@ -391,11 +461,11 @@ class _Contact:
             self.db.execute("UPDATE web_hosts SET robots=?,robots_checked=? WHERE host=?", (rules, self.clock(), host))
         return rules
 
-    def follow(self, url, *, rules=""):
+    def follow(self, url, *, rules="", headers=None):
         host, seen = urlsplit(url).netloc, set()
         for redirects in range(6):
             seen.add(url)
-            result = self.get(url, rules=rules)
+            result = self.get(url, rules=rules, headers=headers)
             if result.status not in (301, 302, 303, 307, 308):
                 break
             location = result.headers.get("location")
@@ -406,6 +476,7 @@ class _Contact:
                     or _ADMIN.search(unquote(urlsplit(target).path))):
                 raise ValueError("Public wiki redirect leaves origin, cycles or is disallowed")
             url = target
+            headers = None  # A validator belongs to the originally requested URI.
         return result
 
 
@@ -423,7 +494,6 @@ class _Page(HTMLParser):
         self.stack = []
         self.blocks, self.current, self.links = [], [], []
         self._regions = {i: [] for i in range(5)}
-        self._link_regions = {i: [] for i in range(5)}
         self._prose_regions = {i: [] for i in range(5)}
         self._paragraph, self._paragraph_region = [], 0
         self._current_region = 0
@@ -439,7 +509,6 @@ class _Page(HTMLParser):
         self._flush_paragraph()
         region = max((i for i, blocks in self._regions.items() if blocks), default=0)
         self.blocks = self._regions[region]
-        self.links = self._link_regions[region]
         self.prose = self._prose_regions[region]
 
     def _flush(self):
@@ -503,8 +572,11 @@ class _Page(HTMLParser):
             match = _LICENSE.fullmatch(href)
             if license_context and match:
                 self.license = ("CC0-1.0" if match[3] else "CC-" + match[1].upper() + "-" + match[2])
-            if tag == "a" and not blocked and "nofollow" not in rel:
-                self._link_regions[region].append(href)
+            if (tag == "a" and href and "nofollow" not in rel
+                    and not any(item[0] in {"form", "script", "style", "noscript"} for item in self.stack)):
+                # Navigation can be the only path to a section. Its text stays
+                # out of the article; outgoing links still pass normal scope checks.
+                self.links.append(href)
         if tag in {"p", "li", "h1", "h2", "h3", "h4", "dt", "dd", "pre", "td", "br"}:
             self._flush()
         if tag not in {"meta", "link", "br", "hr", "img", "input", "source", "wbr", "area", "base", "embed", "param"}:
@@ -546,6 +618,20 @@ def _queue(db, root, url):
     db.execute("INSERT OR IGNORE INTO web_pages(root,url) VALUES(?,?)", (root, url))
 
 
+def _conditional(etag, modified):
+    return {name: value for name, value in (
+        ("If-None-Match", etag), ("If-Modified-Since", modified)) if value}
+
+
+def _sitemap_stamp(entry, ns):
+    value = (entry.findtext("s:lastmod", namespaces=ns) or "").strip()
+    try:
+        datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return value
+
+
 def _discover(db, contact, root, rules):
     """Sitemaps are discovery hints. Their absence never removes known pages."""
     from xml.etree import ElementTree
@@ -564,21 +650,28 @@ def _discover(db, contact, root, rules):
     with db:
         for url in sitemap_urls:
             enqueue(url)
-    due = db.execute("""SELECT url FROM web_sitemaps WHERE root=? AND next_attempt<=?
+    due = db.execute("""SELECT url,etag,modified FROM web_sitemaps WHERE root=? AND next_attempt<=?
         ORDER BY next_attempt,url LIMIT 2""", (root, contact.clock())).fetchall()
     fetched = 0
-    for (url,) in due:
+    for url, etag, modified in due:
         with db:
             db.execute("UPDATE web_sitemaps SET next_attempt=? WHERE root=? AND url=?", (contact.clock()+900, root, url))
-        response = contact.follow(url, rules=rules)
+        conditional = _conditional(etag, modified)
+        response = contact.follow(url, rules=rules, headers=conditional)
         fetched += 1
+        if response.status == 304 and conditional:
+            with db:
+                db.execute("""UPDATE web_sitemaps SET checked=?,next_attempt=?,last_error=NULL
+                    WHERE root=? AND url=?""", (contact.clock(), contact.clock()+86_400, root, url))
+            continue
         if response.status in (404, 410):
             with db:
-                db.execute("UPDATE web_sitemaps SET next_attempt=?,last_error=NULL WHERE root=? AND url=?", (contact.clock()+86_400, root, url))
+                db.execute("""UPDATE web_sitemaps SET next_attempt=?,last_error=NULL,
+                    checked=NULL,etag=NULL,modified=NULL WHERE root=? AND url=?""", (contact.clock()+86_400, root, url))
             continue
         if response.status != 200:
             raise ValueError("Incomplete public wiki sitemap")
-        body = _payload(response, 2_000_000)
+        body = _payload(response, corpus.SITEMAP_LIMIT)
         if re.search(rb"<!\s*(?:DOCTYPE|ENTITY)", body, re.I):
             raise ValueError("Incomplete public wiki sitemap")
         feed = ElementTree.fromstring(body)
@@ -591,16 +684,33 @@ def _discover(db, contact, root, rules):
                         raise ValueError("Incomplete public wiki sitemap")
                     enqueue(location)
             elif feed.tag.endswith("}urlset"):
+                previous = dict(db.execute("""SELECT url,stamp FROM web_sitemap_entries
+                    WHERE root=? AND sitemap=?""", (root, url)))
+                entries = {}
                 for entry in feed.findall("s:url", ns):
                     location = entry.findtext("s:loc", namespaces=ns)
                     if not location:
                         raise ValueError("Incomplete public wiki sitemap")
                     target = _article(root, location)
                     if target:
+                        entries[target] = _sitemap_stamp(entry, ns)
+                for target, stamp in entries.items():
+                    if target not in previous or previous[target] != stamp:
                         _queue(db, root, target)
+                        db.execute("""INSERT INTO web_sitemap_entries VALUES(?,?,?,?)
+                            ON CONFLICT(root,sitemap,url) DO UPDATE SET stamp=excluded.stamp""",
+                            (root, url, target, stamp))
+                        db.execute("UPDATE web_pages SET next_attempt=0 WHERE root=? AND url=?", (root, target))
+                for target in previous.keys() - entries.keys():
+                    db.execute("DELETE FROM web_sitemap_entries WHERE root=? AND sitemap=? AND url=?",
+                               (root, url, target))
+                    # Missing from one map is a reason to verify, never proof of deletion.
+                    db.execute("UPDATE web_pages SET next_attempt=0 WHERE root=? AND url=?", (root, target))
             else:
                 raise ValueError("Unrecognized public wiki sitemap")
-            db.execute("UPDATE web_sitemaps SET next_attempt=?,last_error=NULL WHERE root=? AND url=?", (contact.clock()+86_400, root, url))
+            db.execute("""UPDATE web_sitemaps SET next_attempt=?,last_error=NULL,checked=?,etag=?,modified=?
+                WHERE root=? AND url=?""", (contact.clock()+86_400, contact.clock(),
+                response.headers.get("etag"), response.headers.get("last-modified"), root, url))
     return fetched
 
 
@@ -626,6 +736,11 @@ def refresh_web_sources(db_path, roots, *, batch_size=5, stop_event=None,
     path.parent.mkdir(parents=True, exist_ok=True)
     with closing(sqlite3.connect(path, timeout=2)) as db:
         db.executescript(SCHEMA)
+        map_columns = {r[1] for r in db.execute("PRAGMA table_info(web_sitemaps)")}
+        for name, kind in (("etag", "TEXT"), ("modified", "TEXT"), ("checked", "REAL")):
+            if name not in map_columns:
+                db.execute(f"ALTER TABLE web_sitemaps ADD COLUMN {name} {kind}")
+        db.commit()
         if "discovery_retry" not in {r[1] for r in db.execute("PRAGMA table_info(web_roots)")}:
             db.execute("ALTER TABLE web_roots ADD COLUMN discovery_retry REAL NOT NULL DEFAULT 0")
             db.commit()
@@ -710,7 +825,16 @@ def refresh_web_sources(db_path, roots, *, batch_size=5, stop_event=None,
                 for group in (prefer, 1-prefer):
                     row = db.execute("""SELECT url,etag,last_modified,content_sha256,status,redirect_url FROM web_pages
                         WHERE root=? AND (retrieved_at IS NOT NULL)=? AND next_attempt<=?
-                        ORDER BY next_attempt,url LIMIT 1""", (root, group, _clock())).fetchone()
+                        AND NOT (status='indexed' AND next_attempt>0 AND next_attempt>?
+                            AND last_error IS NULL AND EXISTS (
+                            SELECT 1 FROM web_sitemap_entries e JOIN web_sitemaps s
+                              ON s.root=e.root AND s.url=e.sitemap
+                            WHERE e.root=web_pages.root AND e.url=web_pages.url AND e.stamp IS NOT NULL
+                              AND s.checked>=?))
+                        ORDER BY next_attempt,url LIMIT 1""",
+                        # A fresh sitemap date can defer the weekly recheck, but
+                        # audit after 30 days in case a publisher missed an edit.
+                        (root, group, _clock(), _clock()-23*86_400, _clock()-86_400)).fetchone()
                     if row:
                         break
                 if not row:
@@ -720,7 +844,8 @@ def refresh_web_sources(db_path, roots, *, batch_size=5, stop_event=None,
                 observed = datetime.fromtimestamp(now, UTC).isoformat(timespec="microseconds")
                 with db:
                     db.execute("UPDATE web_roots SET prefer_existing=? WHERE root=?", (1-group, root))
-                    db.execute("UPDATE web_pages SET next_attempt=? WHERE root=? AND url=?", (now+900, root, url))
+                    db.execute("""UPDATE web_pages SET next_attempt=?,last_error='verification_pending'
+                        WHERE root=? AND url=?""", (now+900, root, url))
                 progressed = True
                 selected += 1
                 try:
@@ -730,11 +855,7 @@ def refresh_web_sources(db_path, roots, *, batch_size=5, stop_event=None,
                         with db:
                             _purge(db, root, url, "blocked", observed)
                         raise _Denied("robots_disallowed")
-                    conditional = {}
-                    if etag and old_status == "indexed":
-                        conditional["If-None-Match"] = etag
-                    if modified and old_status == "indexed":
-                        conditional["If-Modified-Since"] = modified
+                    conditional = _conditional(etag, modified) if old_status == "indexed" else {}
                     response = contact.get(url, rules=rules, headers=conditional)
                     header_signals = response.headers.get("x-robots-tag", "")
                     if re.search(r"\b(?:noindex|none|noai|nosnippet)\b|max-snippet\s*:\s*0\b", header_signals, re.I):
@@ -757,7 +878,7 @@ def refresh_web_sources(db_path, roots, *, batch_size=5, stop_event=None,
                             _purge(db, root, url, "removed")
                             db.execute("UPDATE web_pages SET status='removed',retrieved_at=?,next_attempt=?,last_error=NULL WHERE root=? AND url=?", (observed, now+604_800, root, url))
                         continue
-                    if response.status == 304 and old_hash and old_status == "indexed":
+                    if response.status == 304 and conditional and old_hash and old_status == "indexed":
                         if re.search(r"\bnoarchive\b", header_signals, re.I):
                             raise _Denied("publisher_full_text_denied")
                         with db:
@@ -807,9 +928,10 @@ def refresh_web_sources(db_path, roots, *, batch_size=5, stop_event=None,
                     with db:
                         if old_hash and old_hash != content_hash or old_status in {"removed", "redirected", "blocked"}:
                             corpus.record_source_change(db, url, observed, "web_page_changed")
-                        db.execute("DELETE FROM web_passages WHERE root=? AND url=?", (root, url))
-                        db.executemany("INSERT INTO web_passages(root,url,ordinal,title,text) VALUES(?,?,?,?,?)",
-                            [(root, url, i, title, text) for i, text in enumerate(passages)])
+                        if old_hash != content_hash or old_status != "indexed":
+                            db.execute("DELETE FROM web_passages WHERE root=? AND url=?", (root, url))
+                            db.executemany("INSERT INTO web_passages(root,url,ordinal,title,text) VALUES(?,?,?,?,?)",
+                                [(root, url, i, title, text) for i, text in enumerate(passages)])
                         db.execute("""UPDATE web_pages SET title=?,status='indexed',license=?,storage_mode=?,
                             retrieved_at=?,etag=?,last_modified=?,content_sha256=?,next_attempt=?,last_error=NULL,redirect_url=NULL
                             WHERE root=? AND url=?""", (title, page.license, mode, observed,
@@ -901,6 +1023,11 @@ def web_coverage(db_path, roots):
     for row in _read(db_path, """SELECT root,last_discovery,last_success,last_error FROM web_roots
             WHERE root IN (SELECT value FROM json_each(?))""", (encoded,)):
         result[row.pop("root")].update(row)
+    for root in roots:
+        result[root]["first_gaps"] = _read(db_path, """SELECT url,status,storage_mode,last_error
+            FROM web_pages WHERE root=? AND (status IN ('pending','blocked') OR
+              (status='indexed' AND storage_mode='short_excerpt'))
+            ORDER BY last_error IS NOT NULL DESC,status,url LIMIT 5""", (root,))
     for row in _read(db_path, """SELECT root,url,last_success,last_error,cursor IS NOT NULL AS enumeration_pending
             FROM web_apis WHERE root IN (SELECT value FROM json_each(?))""", (encoded,)):
         row["enumeration_pending"] = bool(row["enumeration_pending"])

@@ -238,6 +238,25 @@ class SnapshotTests(unittest.TestCase):
         }
         assert all(value.endswith("+00:00") for value in observed.values())
 
+    def test_replacing_an_export_does_not_rewrite_unchanged_article_or_fts_row(self):
+        db, source = self.tmp_path / "local.sqlite3", self.tmp_path / "wiki.xml"
+        stable = _page("Repair", 1, _revision(1, "2025-01-01T00:00:00Z", "Stable offline text"))
+        def export(rev):
+            source.write_text(_xml(stable, _page("Fuel", 2, _revision(
+                rev, "2025-03-01T00:00:00Z", f"Changed text edition {rev}"))), encoding="utf-8")
+        export(1)
+        import_snapshot(db, source)
+        with closing(sqlite3.connect(db)) as con:
+            con.executescript("""CREATE TRIGGER protect_unchanged BEFORE DELETE ON snapshot_pages
+                WHEN OLD.title='Repair' BEGIN SELECT RAISE(FAIL,'rewrote unchanged article'); END;""")
+            original = con.execute("SELECT rowid FROM snapshot_search WHERE title='Repair'").fetchone()
+        export(2)
+        import_snapshot(db, source)
+        with closing(sqlite3.connect(db)) as con:
+            assert con.execute("SELECT rowid FROM snapshot_search WHERE title='Repair'").fetchone() == original
+            assert con.execute("SELECT url FROM source_changes").fetchall() == [
+                ("https://game-wiki.example.org/wiki/Fuel",)]
+
 
     def test_distinct_source_files_do_not_clobber_each_other_and_unchanged_is_fast(self):
         tmp_path = self.tmp_path

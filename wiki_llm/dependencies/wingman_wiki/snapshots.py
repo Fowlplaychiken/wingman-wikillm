@@ -644,35 +644,46 @@ def import_snapshot(db_path: Path | str, path: Path | str, *,
             # starting the atomic replacement transaction in the main database.
             db.commit()
             db.execute("BEGIN IMMEDIATE")
+            if _stat_key(source_path.stat()) != _stat_key(original_stat):
+                raise SnapshotError("snapshot changed before publication")
             previous_source = db.execute("SELECT 1 FROM snapshot_sources WHERE source_id=?",
                                          (source_id,)).fetchone() is not None
+            db.execute("CREATE TEMP TABLE snapshot_delta(page_key TEXT PRIMARY KEY)")
+            fields = ("url","source_origin","title","body","revision","revision_timestamp",
+                      "namespace","namespace_name","redirect_target","game_build","links_json")
+            old_fields = ",".join("p."+col for col in fields)
+            new_fields = ",".join("s."+col for col in fields)
+            db.execute(f"""INSERT INTO snapshot_delta SELECT s.page_key FROM snapshot_stage s
+                LEFT JOIN snapshot_pages p ON p.source_id=? AND p.page_key=s.page_key
+                WHERE p.page_key IS NULL OR ({old_fields}) IS NOT ({new_fields})""", (source_id,))
             if previous_source:
-                old_pages = {row[0]: row[1:] for row in db.execute(
-                    "SELECT url,title,body,revision,revision_timestamp FROM snapshot_pages WHERE source_id=?",
-                    (source_id,))}
-                new_pages = {row[0]: row[1:] for row in db.execute(
-                    "SELECT url,title,body,revision,revision_timestamp FROM snapshot_stage")}
+                db.execute("""INSERT INTO snapshot_delta SELECT p.page_key FROM snapshot_pages p
+                    WHERE p.source_id=? AND NOT EXISTS (SELECT 1 FROM snapshot_stage s
+                        WHERE s.page_key=p.page_key)""", (source_id,))
+                db.execute("CREATE INDEX snapshot_stage_url ON snapshot_stage(url)")
                 observed_at = datetime.now(timezone.utc).isoformat(timespec="microseconds")
-                changes = []
-                changes.extend((url, "snapshot_page_removed") for url in old_pages.keys() - new_pages.keys())
-                changes.extend((url, "snapshot_page_added") for url in new_pages.keys() - old_pages.keys())
-                for url in old_pages.keys() & new_pages.keys():
-                    old, new = old_pages[url], new_pages[url]
-                    if old != new:
-                        reason = "snapshot_revision_changed" if old[2:] != new[2:] else "snapshot_content_changed"
-                        changes.append((url, reason))
-                db.executemany("""INSERT INTO source_changes VALUES(?,?,?)
-                    ON CONFLICT(url) DO UPDATE SET observed_at=excluded.observed_at,
-                    reason=excluded.reason""",
-                    ((url, observed_at, reason) for url, reason in changes))
-            db.execute("DELETE FROM snapshot_search WHERE source_id=?", (source_id,))
-            db.execute("DELETE FROM snapshot_pages WHERE source_id=?", (source_id,))
+                db.execute("""INSERT OR REPLACE INTO source_changes
+                    SELECT p.url,?,'snapshot_page_removed' FROM snapshot_pages p
+                    WHERE p.source_id=? AND NOT EXISTS (SELECT 1 FROM snapshot_stage s WHERE s.url=p.url)
+                    UNION ALL
+                    SELECT s.url,?,CASE WHEN p.url IS NULL THEN 'snapshot_page_added'
+                        WHEN (p.revision,p.revision_timestamp) IS NOT (s.revision,s.revision_timestamp)
+                            THEN 'snapshot_revision_changed' ELSE 'snapshot_content_changed' END
+                    FROM snapshot_stage s LEFT JOIN snapshot_pages p ON p.url=s.url AND p.source_id=?
+                    WHERE p.url IS NULL OR (p.title,p.body,p.revision,p.revision_timestamp)
+                        IS NOT (s.title,s.body,s.revision,s.revision_timestamp)""",
+                    (observed_at, source_id, observed_at, source_id))
+                db.execute("""DELETE FROM snapshot_search WHERE source_id=?
+                    AND page_key IN (SELECT page_key FROM snapshot_delta)""", (source_id,))
+                db.execute("""DELETE FROM snapshot_pages WHERE source_id=?
+                    AND page_key IN (SELECT page_key FROM snapshot_delta)""", (source_id,))
             db.execute("""INSERT INTO snapshot_pages(source_id,page_key,url,source_origin,title,body,
                 revision,revision_timestamp,namespace,namespace_name,redirect_target,game_build,links_json)
                 SELECT ?,page_key,url,source_origin,title,body,revision,revision_timestamp,namespace,
-                namespace_name,redirect_target,game_build,links_json FROM snapshot_stage""", (source_id,))
+                namespace_name,redirect_target,game_build,links_json FROM snapshot_stage
+                JOIN snapshot_delta USING(page_key)""", (source_id,))
             db.execute("""INSERT INTO snapshot_search(source_id,page_key,title,body)
-                SELECT ?,page_key,title,body FROM snapshot_stage""", (source_id,))
+                SELECT ?,page_key,title,body FROM snapshot_stage JOIN snapshot_delta USING(page_key)""", (source_id,))
             imported_at = datetime.now(timezone.utc).isoformat(timespec="microseconds")
             db.execute("""INSERT INTO snapshot_sources(source_id,file_name,file_format,source_origin,
                 content_sha256,file_size,page_count,imported_at) VALUES(?,?,?,?,?,?,?,?)

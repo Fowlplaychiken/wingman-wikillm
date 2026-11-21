@@ -22,9 +22,10 @@ Open **WikiLLM’s skill settings** in Wingman.
 | Another game too | Paste its public wiki home address into **Other game wikis**, one HTTPS URL per line. |
 | Only another game | Add its address and turn **Use the Star Citizen library** off. |
 | A particular section | Use its directory URL ending in `/`, such as `https://wiki.openttd.org/en/Manual/`. |
+| Pause one wiki | Put `#` before its address and save. Remove `#` to show its saved pages and resume updates. |
 | No internet access from the skill | Turn **Check online wikis for updates** off. You can still add or replace a local export. |
 
-Save the settings. For each chosen other-game wiki, WikiLLM checks the site’s sitemap and follows links to deeper pages. Each pass resumes where it left off. Ask **“How much of my wiki is available offline?”** to see what has been discovered and saved. Removing a URL hides that source from answers and stops its updates. Adding it back reuses its saved pages. Your field notes survive either change.
+Ask **“How much of my wiki is available offline?”** to see what the library contains. WikiLLM follows section menus, article links and sitemaps. On compatible MediaWiki sites it also asks for the publisher’s article list to find unlinked pages. Each pass resumes from its saved position.
 
 ## What can it answer offline?
 
@@ -39,7 +40,9 @@ Questions search the local index. Opening a publisher link uses the internet. Fo
 
 ## Keep your own discoveries
 
-Say **“Save this as a draft field note”** and describe what you saw. Ask **“Which of my notes need review?”** to find drafts and notes whose sources have changed. Once you’ve checked the evidence, ask Wingman to mark the note reviewed and cite it. You can ask for its history, correct it or withdraw it. Your Wingman’s selected conversation model can also save findings during research. Background updates fetch and index sources without using model tokens.
+Describe something you observed in the game. With **Automatically draft game notes** on, your usual conversation model can save a private draft during that turn. You can also say **“Save this as a draft field note.”** Turn the setting off if you prefer to ask each time.
+
+Ask **“Which of my notes need review?”** to see drafts and notes whose sources have changed. Once you’ve checked the evidence, ask Wingman to mark a note reviewed. You can correct it later, see its history or withdraw it. Background source updates use no model tokens.
 
 Wingmen under the same computer user account share the library. Other players start with their own notes. If you use a hosted conversation model, Wingman can send it the retrieved passages, including a matching private note. Choose a local conversation model if you want that exchange to stay on your hardware.
 
@@ -56,6 +59,8 @@ The updater checks hourly while the skill is loaded. While it is making progress
 **Coverage is local and source-specific.** Status separates indexed title URLs, saved community excerpts, and complete article text. Its deterministic Star Citizen preset totals count each known URL once and state full-text coverage among those known URLs. Local imports are totaled separately by unique URL and publisher origin; an import can overlap a known URL, so do not add the two totals. Private notes are excluded from source-coverage counts. A title or excerpt is not full-text coverage; custom-wiki coverage is based on URLs discovered so far, not a complete publisher inventory. A complete current export or independently supplied inventory is needed to account for unlinked pages.
 
 Back up the `.starcitizen-wiki` folder in your user home with Wingman closed. It holds the database, notes and any exports you added. To update the skill, replace only its folder under `custom_skills`. WikiLLM works independently of other skills and requires no Wingman Core changes.
+
+**Later syncs reuse your library.** WikiLLM checks publisher update dates and HTTP change indicators when available. A changed child sitemap can reveal a new article even when its parent index stays the same. Sites without change indicators may require another page download to detect an edit. Replacing a local export updates changed, new and removed articles while preserving your notes. [Sitemap update dates](https://www.sitemaps.org/protocol.html) · [HTTP conditional requests](https://www.rfc-editor.org/rfc/rfc9110.html#name-conditional-requests)
 
 <details>
 <summary>Use the library from another assistant or the command line</summary>

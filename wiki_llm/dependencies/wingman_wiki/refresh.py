@@ -79,10 +79,10 @@ def _cancelled(stop_event):
         raise corpus.RefreshCancelled()
 
 
-def _catalog(publisher, name, stop_event):
+def _catalog(publisher, name, stop_event, db=None):
     records = {}
     items = (publisher.galactapedia() if name == "galactapedia" else
-             corpus.sitemap_entries(publisher, corpus.SITEMAPS[CATALOGS.index(name)], set()))
+             corpus.sitemap_entries(publisher, corpus.SITEMAPS[CATALOGS.index(name)], set(), db))
     for url, value in items:
         _cancelled(stop_event)
         if not corpus.indexable(url) or _owner(url) != name:
@@ -158,7 +158,7 @@ def _refresh_once(db_path: str | Path, *, batch_size: int = 5,
                     report.catalogs[name] = {"state": "not_due", "stale": bool(state[2])}
                     continue
                 try:
-                    records = _catalog(source, name, stop_event)
+                    records = _catalog(source, name, stop_event, db)
                     _cancelled(stop_event)
                     with db:
                         _apply_catalog(db, name, records, datetime.fromtimestamp(now, UTC).isoformat(timespec="microseconds"))
