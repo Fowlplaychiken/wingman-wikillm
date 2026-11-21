@@ -282,6 +282,8 @@ def refresh_once(db_path: str | Path, *, batch_size: int = 5,
         return RefreshReport(cancelled=True)
     enabled = _enabled_catalogs(enabled_catalogs)
     path = Path(db_path).expanduser()
+    if not enabled and not roots and import_snapshots and not (path.parent / "snapshots").exists():
+        return RefreshReport()
     path.parent.mkdir(parents=True, exist_ok=True)
     token = uuid.uuid4().hex
     with closing(sqlite3.connect(path, timeout=2)) as db:
@@ -313,9 +315,11 @@ def refresh_once(db_path: str | Path, *, batch_size: int = 5,
     try:
         if isinstance(publisher, corpus.Publisher):
             publisher.stop_event = cancellation
-        report = _refresh_once(path, batch_size=batch_size, catalog_interval=catalog_interval,
-            page_interval=page_interval, publisher=publisher, stop_event=cancellation, clock=clock,
-            enabled_catalogs=enabled)
+        report = RefreshReport()
+        if enabled:
+            report = _refresh_once(path, batch_size=batch_size, catalog_interval=catalog_interval,
+                page_interval=page_interval, publisher=publisher, stop_event=cancellation, clock=clock,
+                enabled_catalogs=enabled)
         if roots and not cancellation.is_set():
             from .web_sources import refresh_web_sources
             try:

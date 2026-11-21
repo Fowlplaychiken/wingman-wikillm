@@ -1,4 +1,5 @@
 from contextlib import closing
+from datetime import datetime, timezone
 import json
 import socket
 import sqlite3
@@ -13,6 +14,28 @@ GUIDES = Path(__file__).resolve().parents[1] / "wiki_llm" / "guides"
 
 
 class OfflineLibraryTests(unittest.TestCase):
+    def test_review_queue_finds_drafts_and_stale_citations_and_advances_after_review(self):
+        from wiki_llm.dependencies.wingman_wiki.library import review_queue
+        with patch.object(socket, "socket", side_effect=AssertionError("network access")):
+            self.assertEqual(review_queue(self.db)["notes"], [])
+            url = "https://starcitizen.tools/Aberdeen"
+            for slug, state in (("a", "draft"), ("b", "reviewed"), ("c", "withdrawn"), ("d", "reviewed")):
+                record_note(slug, "Visibility", "Observed haze", status=state, db_path=self.db,
+                            source=url + "#Atmosphere" if slug == "b" else None)
+            with closing(sqlite3.connect(self.db)) as db, db:
+                db.execute("CREATE TABLE source_changes(url TEXT, observed_at TEXT, reason TEXT)")
+                db.execute("INSERT INTO source_changes VALUES(?, ?, ?)",
+                           (url, datetime.now(timezone.utc).isoformat(timespec="microseconds"), "changed"))
+            first = review_queue(self.db, limit=1)
+            self.assertEqual([(r["slug"], r["reason"]) for r in first["notes"]], [("a", "draft")])
+            second = review_queue(self.db, after=first["next_after"], limit=1)
+            self.assertEqual([(r["slug"], r["revision"], r["reason"]) for r in second["notes"]],
+                             [("b", 1, "source_changed")])
+            self.assertIsNone(second["next_after"])
+            record_note("b", "Visibility", "Rechecked haze", status="reviewed", previous_revision=1,
+                        source=url, db_path=self.db)
+            self.assertEqual([r["slug"] for r in review_queue(self.db)["notes"]], ["a"])
+
     def setUp(self):
         root = tempfile.TemporaryDirectory()
         self.addCleanup(root.cleanup)

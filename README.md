@@ -22,7 +22,7 @@ Open **WikiLLM’s skill settings** in Wingman.
 | Another game too | Paste its public wiki home address into **Other game wikis**, one HTTPS URL per line. |
 | Only another game | Add its address and turn **Use the Star Citizen library** off. |
 | A particular section | Use its directory URL ending in `/`, such as `https://wiki.openttd.org/en/Manual/`. |
-| No internet access from the skill | Turn **Update the reference library in the background** off after saving the pages you want. |
+| No internet access from the skill | Turn **Check online wikis for updates** off. You can still add or replace a local export. |
 
 Save the settings. While the skill is loaded, WikiLLM checks the site’s sitemap and follows links to deeper pages within the chosen wiki. Each pass resumes where it left off. Ask **“How much of my wiki is available offline?”** to see what has been discovered and saved. Removing a URL hides that source from answers and stops its updates. Adding it back reuses its saved pages. Your field notes survive either change.
 
@@ -39,7 +39,7 @@ Questions search the local index. Opening a publisher link uses the internet. Fo
 
 ## Keep your own discoveries
 
-Say **“Save this as a draft field note”** and describe what you saw. When you’ve checked it, ask Wingman to mark it reviewed and cite the source. You can later ask for its history, correct it or withdraw it. Your Wingman’s selected conversation model can also save findings during research. Local and API models use the same tools. Background updates fetch and index sources without using model tokens.
+Say **“Save this as a draft field note”** and describe what you saw. Ask **“Which of my notes need review?”** to find drafts and notes whose sources have changed. Once you’ve checked the evidence, ask Wingman to mark the note reviewed and cite it. You can ask for its history, correct it or withdraw it. Your Wingman’s selected conversation model can also save findings during research. Background updates fetch and index sources without using model tokens.
 
 Wingmen under the same computer user account share the library. Other players start with their own notes. If you use a hosted conversation model, Wingman can send it the retrieved passages, including a matching private note. Choose a local conversation model if you want that exchange to stay on your hardware.
 
@@ -61,6 +61,7 @@ python -m wiki_llm --no-sc --wiki https://wiki.openttd.org/en/Manual/ refresh
 python -m wiki_llm --no-sc --wiki https://wiki.openttd.org/en/Manual/ status
 python -m wiki_llm --no-sc --wiki https://wiki.openttd.org/en/Manual/ lookup "railways"
 python -m wiki_llm import game-wiki.xml
+python -m wiki_llm review
 python -m wiki_llm --no-sc --wiki https://wiki.wesnoth.org/ verify publisher-inventory.jsonl
 ```
 

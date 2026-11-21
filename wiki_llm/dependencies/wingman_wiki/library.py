@@ -7,7 +7,7 @@ from pathlib import Path
 from urllib.parse import urldefrag, urlsplit
 
 from . import corpus
-from .coverage import full_pages, verify_inventory
+from .coverage import SQLITE_WHITESPACE, full_pages, verify_inventory
 from .snapshots import read_snapshot_page, search_snapshots
 from .web_sources import in_scope, read_web_page, search_web_sources, web_coverage
 from .reference import WikiReference, _build_key, _query_terms, community_db_path
@@ -82,6 +82,7 @@ def note_history(slug, db_path=None, before=None):
 
 def _source_changes(references, db_path):
     """Relate local reviews to publisher changes already observed by the updater."""
+    by_url = {}
     for ref in references:
         urls = {urldefrag(url)[0] for url in ref.get("source_links", [])}
         if ref.get("citation", "") and ref["citation"].startswith("https://"):
@@ -89,18 +90,44 @@ def _source_changes(references, db_path):
         stamp = ref.get("reviewed") or ref.get("recorded_at") or ""
         if not urls or not stamp:
             continue
-        slots = ",".join("?" for _ in urls)
-        evidence = _read(db_path, f"SELECT url,lastmod,status FROM wiki_urls WHERE url IN ({slots})",
-                         tuple(urls), "wiki_urls")
-        changes = [row for row in evidence if row["status"] == "removed"
-                   or (row["lastmod"] or "")[:10] > stamp[:10]]
-        for row in _read(db_path, f"SELECT url,observed_at,reason FROM source_changes WHERE url IN ({slots})",
-                         tuple(urls), "source_changes"):
-            if row["observed_at"] > stamp:
-                changes.append(row)
-        if changes:
-            ref["needs_review"] = True
-            ref["changed_sources"] = changes
+        for url in urls:
+            by_url.setdefault(url, []).append((ref, stamp))
+    if not by_url:
+        return
+    urls = tuple(by_url)
+    slots = ",".join("?" for _ in urls)
+    rows = _read(db_path, f"SELECT url,lastmod,status FROM wiki_urls WHERE url IN ({slots})", urls, "wiki_urls")
+    rows += _read(db_path, f"SELECT url,observed_at,reason FROM source_changes WHERE url IN ({slots})",
+                  urls, "source_changes")
+    for row in rows:
+        for ref, stamp in by_url[row["url"]]:
+            if (row.get("status") == "removed" or (row.get("lastmod") or "")[:10] > stamp[:10]
+                    or row.get("observed_at", "") > stamp):
+                ref["needs_review"] = True
+                ref.setdefault("changed_sources", []).append(row)
+
+
+def review_queue(db_path=None, *, after=None, limit=10):
+    """List the latest drafts and reviewed notes affected by source changes."""
+    if type(limit) is not int or not 1 <= limit <= 50 or (after is not None and not isinstance(after, str)):
+        raise ValueError("Use a topic ID as the cursor and request 1 to 50 notes.")
+    cursor, notes = after or "", []
+    while len(notes) <= limit:
+        batch = _read(db_path, """SELECT n.slug,n.title,n.revision,n.status,n.source AS citation,n.recorded_at
+            FROM note_revisions n WHERE n.slug>? AND n.status!='withdrawn'
+            AND n.revision=(SELECT max(r.revision) FROM note_revisions r WHERE r.slug=n.slug)
+            ORDER BY n.slug LIMIT 100""", (cursor,), "note_revisions")
+        if not batch:
+            break
+        _source_changes(batch, db_path)
+        for row in batch:
+            if row["status"] == "draft" or row.get("needs_review"):
+                row["reason"] = "draft" if row["status"] == "draft" else "source_changed"
+                notes.append(row)
+        cursor = batch[-1]["slug"]
+        if len(batch) < 100:
+            break
+    return {"notes": notes[:limit], "next_after": notes[limit-1]["slug"] if len(notes) > limit else None}
 
 
 def _selected(url, include_star_citizen, roots):
@@ -151,7 +178,9 @@ def library_status(db_path=None, *, include_star_citizen=True, roots=()):
             if db.execute("SELECT 1 FROM sqlite_master WHERE name='snapshot_pages'").fetchone():
                 db.create_function("enabled", 1, allowed)
                 imports = [{"origin": host, "saved_articles": count} for host, count in db.execute(
-                    "SELECT source_origin,count(distinct url) FROM snapshot_pages WHERE enabled(url) GROUP BY source_origin")]
+                    "SELECT source_origin,count(distinct url) FROM snapshot_pages "
+                    "WHERE enabled(url) AND trim(body, ?) != '' GROUP BY source_origin",
+                    (SQLITE_WHITESPACE,))]
     status = {"star_citizen_enabled": include_star_citizen, "custom_wikis": web_coverage(path, roots),
               "imported_articles": imports}
     for root, info in status["custom_wikis"].items():

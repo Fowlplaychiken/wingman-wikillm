@@ -4,6 +4,8 @@ import sqlite3
 from contextlib import closing
 from pathlib import Path
 
+SQLITE_WHITESPACE = "\t\n\v\f\r \x1c\x1d\x1e\x1f\x85\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000"
+
 
 def full_pages(db_path):
     """Map original URLs to the revisions whose article text is saved locally."""
@@ -14,7 +16,11 @@ def full_pages(db_path):
     with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as db:
         tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         if "snapshot_pages" in tables:
-            for url, revision in db.execute("SELECT url,revision FROM snapshot_pages WHERE body!=''"):
+            # Keep the large article bodies in SQLite. This also excludes
+            # whitespace-only rows left by older importer versions.
+            for url, revision in db.execute(
+                    "SELECT url,revision FROM snapshot_pages WHERE trim(body, ?) != ''",
+                    (SQLITE_WHITESPACE,)):
                 pages.setdefault(url, set()).add(revision)
         if "web_pages" in tables:
             for url, in db.execute("SELECT DISTINCT url FROM web_pages WHERE status='indexed' AND storage_mode='full_text'"):

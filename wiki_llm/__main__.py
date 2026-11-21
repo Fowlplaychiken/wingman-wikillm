@@ -4,7 +4,7 @@ from dataclasses import asdict
 import json
 from pathlib import Path
 
-from .dependencies.wingman_wiki.library import check_inventory, library_status, lookup, note_history, read_page
+from .dependencies.wingman_wiki.library import check_inventory, library_status, lookup, note_history, read_page, review_queue
 from .dependencies.wingman_wiki.reference import community_db_path
 from .dependencies.wingman_wiki.refresh import refresh_once, snapshot_limits
 from .dependencies.wingman_wiki.snapshots import import_snapshot
@@ -23,6 +23,8 @@ def main():
     history = commands.add_parser("history", help="Read revisions of one local note")
     history.add_argument("topic")
     history.add_argument("--before", type=int)
+    review = commands.add_parser("review", help="Find drafts and notes with changed sources")
+    review.add_argument("--after", help="Continue from a previous next_after topic ID")
     article = commands.add_parser("read", help="Read a saved page without connecting")
     article.add_argument("url")
     article.add_argument("--offset", type=int, default=0)
@@ -42,6 +44,8 @@ def main():
             result = lookup(Path(__file__).with_name("guides"), args.query, args.build, db, **options)
         elif args.command == "history":
             result = note_history(args.topic, db, args.before)
+        elif args.command == "review":
+            result = review_queue(db, after=args.after)
         elif args.command == "read":
             result = read_page(db, args.url, offset=args.offset, **options)
         elif args.command == "status":
