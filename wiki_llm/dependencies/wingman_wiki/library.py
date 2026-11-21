@@ -173,6 +173,7 @@ def library_status(db_path=None, *, include_star_citizen=True, roots=()):
     allowed = lambda url: _selected(url, include_star_citizen, roots)
     full = full_pages(path)
     imports = []
+    imported_total = 0
     if path.is_file():
         with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as db:
             if db.execute("SELECT 1 FROM sqlite_master WHERE name='snapshot_pages'").fetchone():
@@ -182,6 +183,10 @@ def library_status(db_path=None, *, include_star_citizen=True, roots=()):
                     "SELECT source_origin,count(distinct url) FROM snapshot_pages "
                     "WHERE enabled(url) AND trim(body, ?) != '' GROUP BY source_origin",
                     (SQLITE_WHITESPACE,))]
+                imported_total = db.execute(
+                    "SELECT count(distinct url) FROM snapshot_pages "
+                    "WHERE enabled(url) AND trim(body, ?) != ''",
+                    (SQLITE_WHITESPACE,)).fetchone()[0]
     status = {"star_citizen_enabled": include_star_citizen, "custom_wikis": web_coverage(path, roots),
               "imported_articles": imports}
     for root, info in status["custom_wikis"].items():
@@ -222,6 +227,46 @@ def library_status(db_path=None, *, include_star_citizen=True, roots=()):
             {"name": name, **last_updates.get(name, {"last_success": None, "last_error": None}),
              "automatic_acquisition": acquisitions[name]}
             for name in catalog_names])
+        # wiki_urls has one row per URL, and catalog_owner assigns each row to
+        # exactly one bucket, so these sums describe unique known URLs.
+        totals = {
+            "enabled": True,
+            "unique_known_title_urls": sum(counts[name]["titles"] for name in catalog_names),
+            "saved_community_excerpt_urls": counts["community"]["excerpts"],
+            "full_text_for_known_urls": sum(
+                counts[name]["full_text_for_known_urls"] for name in catalog_names),
+            "missing_full_text_for_known_urls": sum(
+                counts[name]["missing_full_text"] for name in catalog_names),
+        }
+        status["coverage_totals"] = {
+            "star_citizen_preset": totals,
+            "all_enabled_local_imports": {"unique_article_urls": imported_total},
+            "private_notes": {"included_in_coverage_totals": False},
+        }
+        sources = "; ".join(
+            f"{name} {counts[name]['titles']}" for name in catalog_names)
+        status["coverage_summary"] = (
+            f"Star Citizen built-in preset: {totals['unique_known_title_urls']:,} unique known title URLs "
+            f"({sources}); {totals['saved_community_excerpt_urls']:,} saved community excerpt URLs; "
+            f"full text for {totals['full_text_for_known_urls']:,} of "
+            f"{totals['unique_known_title_urls']:,} known URLs, with "
+            f"{totals['missing_full_text_for_known_urls']:,} missing. Separately, "
+            f"{imported_total:,} distinct local imported article URLs are enabled across all selected sources "
+            "(see imported_articles by origin); imports can overlap known-URL coverage and are not added "
+            "to the preset total. Private notes are excluded from coverage totals."
+        )
+    else:
+        status["coverage_totals"] = {
+            "star_citizen_preset": {"enabled": False},
+            "all_enabled_local_imports": {"unique_article_urls": imported_total},
+            "private_notes": {"included_in_coverage_totals": False},
+        }
+        status["coverage_summary"] = (
+            "Star Citizen built-in preset is disabled; no preset coverage totals are reported. "
+            f"Total enabled local imported article URLs (all imports): {imported_total:,} distinct "
+            "across all selected sources (see imported_articles by origin). Private notes are excluded "
+            "from coverage totals."
+        )
     return status
 
 
