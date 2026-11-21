@@ -76,7 +76,7 @@ def _admin_endpoint(path):
     return bool(_ADMIN.search(path) or _ADMIN_ROOT.match(path))
 
 
-def _url(value):
+def _url(value, *, mediawiki_endpoint=False):
     if not isinstance(value, str) or not value or len(value) > 2000 or any(c.isspace() or ord(c) < 32 for c in value):
         raise ValueError("Use a public HTTPS wiki URL without spaces")
     p = urlsplit(value)
@@ -104,7 +104,8 @@ def _url(value):
         raise ValueError("Ambiguous wiki path")
     if any(ord(c) < 32 for c in decoded):
         raise ValueError("Invalid wiki path")
-    if _admin_endpoint(decoded):
+    route = decoded.removesuffix("/api.php") if mediawiki_endpoint else decoded
+    if _admin_endpoint(route):
         raise ValueError("Wiki admin endpoints are not article URLs")
     query = ""
     if p.query:
@@ -197,7 +198,7 @@ def _network_url(url):
         return _url(url)
     except ValueError:
         parsed = urlsplit(url)
-        base = _url(urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", "")))
+        base = _url(urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", "")), mediawiki_endpoint=True)
         pairs = parse_qsl(parsed.query, keep_blank_values=True, strict_parsing=True)
         fields = dict(pairs)
         namespace = fields.get("apnamespace", "")
@@ -216,7 +217,7 @@ def _api_endpoint(root, edit_uri):
     """Accept only a publisher-declared MediaWiki EditURI in this wiki family."""
     try:
         parsed = urlsplit(urljoin(root, edit_uri))
-        endpoint = _url(urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", "")))
+        endpoint = _url(urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", "")), mediawiki_endpoint=True)
         fields = parse_qsl(parsed.query, keep_blank_values=True, strict_parsing=True)
     except ValueError:
         return None
