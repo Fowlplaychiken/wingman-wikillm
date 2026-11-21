@@ -111,6 +111,7 @@ def test_refresh_publishes_complete_feed_and_reuses_each_page_validator(tmp_path
 
 
 @pytest.mark.parametrize("policy", [
+    {"Content-Signal": "search=yes, use=immediate"},
     {"X-Robots-Tag": "noarchive"},
     {"Cache-Control": "private, no-store"},
     {"Content-Signal": "use=reference"},

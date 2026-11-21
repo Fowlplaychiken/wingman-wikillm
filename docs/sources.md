@@ -14,6 +14,8 @@ If the publisher uses different field names, paste a one-line mapping. This exam
 
 ## Updates and offline coverage
 
+For a wiki that declares the GNU Free Documentation License in its copyright footer or document license link, WikiLLM checks the complete license at the publisher's own address. When storage is permitted, your local library keeps the original article HTML, including its notices and source links, and one copy of the publisher's license. The reader cites the article and links to the license. WikiLLM rechecks the terms and withdraws affected copies when the publisher restricts storage. On OpenTTD, all nine English Tutorial articles were readable with DNS disabled, including the closing guidance on the Buses page. [OpenTTD tutorial](https://wiki.openttd.org/en/Manual/Tutorial/) · [Publisher license](https://wiki.openttd.org/License)
+
 WikiLLM updates while the skill is loaded. Change **Hours between background passes** to set the schedule. The initial download continues in small batches while the publisher allows it. Unchanged pages can return a change indicator without sending their bodies again. Some sites supply whole groups of articles or lack change indicators. Switch **Check online wikis for updates** off for offline use.
 
 For a whole wiki, supply its home URL. For a section, use its directory URL ending in `/`. The crawler respects robots.txt and publisher storage policies. Links, section menus, sitemaps and a compatible MediaWiki page list help it reach nested and unlinked pages. A site may exclude articles or publish only part of its inventory. Ask Wingman for coverage before relying on a specific article offline.

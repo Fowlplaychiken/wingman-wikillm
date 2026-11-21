@@ -12,6 +12,7 @@ FILES = (
     "dependencies/wingman_wiki/__init__.py", "dependencies/wingman_wiki/reference.py",
     "dependencies/wingman_wiki/library.py", "dependencies/wingman_wiki/corpus.py",
     "dependencies/wingman_wiki/refresh.py", "dependencies/wingman_wiki/web_sources.py",
+    "dependencies/wingman_wiki/publisher_licenses.py",
     "dependencies/wingman_wiki/snapshots.py", "dependencies/wingman_wiki/sc_archive.py",
     "dependencies/wingman_wiki/coverage.py", "dependencies/wingman_wiki/galactapedia_feed.py",
     "dependencies/wingman_wiki/json_feeds.py", "dependencies/wingman_wiki/source_choices.py", "guides/README.md",

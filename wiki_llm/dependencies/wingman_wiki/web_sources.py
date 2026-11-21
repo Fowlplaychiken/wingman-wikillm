@@ -21,9 +21,11 @@ import re
 import socket
 import sqlite3
 import time
+import zlib
 from urllib.parse import parse_qsl, quote, unquote, urlencode, urljoin, urlsplit, urlunsplit
 
 from . import corpus
+from .publisher_licenses import gfdl_license
 from .reference import _query_terms
 
 SCHEMA = """
@@ -36,7 +38,7 @@ CREATE TABLE IF NOT EXISTS web_pages(root TEXT NOT NULL,url TEXT NOT NULL,title 
  status TEXT NOT NULL DEFAULT 'pending',license TEXT,storage_mode TEXT,
  retrieved_at TEXT,etag TEXT,last_modified TEXT,content_sha256 TEXT,
  next_attempt REAL NOT NULL DEFAULT 0,last_error TEXT,redirect_url TEXT,
- links_scanned INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(root,url));
+ links_scanned INTEGER NOT NULL DEFAULT 0,license_url TEXT,PRIMARY KEY(root,url));
 CREATE INDEX IF NOT EXISTS web_pages_due ON web_pages(root,next_attempt,url);
 CREATE VIRTUAL TABLE IF NOT EXISTS web_passages USING fts5(
  root UNINDEXED,url UNINDEXED,ordinal UNINDEXED,title,text,tokenize='porter unicode61');
@@ -51,6 +53,12 @@ CREATE INDEX IF NOT EXISTS web_sitemap_article ON web_sitemap_entries(root,url);
 CREATE TABLE IF NOT EXISTS web_apis(root TEXT PRIMARY KEY,url TEXT NOT NULL,cursor TEXT,
  next_attempt REAL NOT NULL DEFAULT 0,last_success REAL,last_error TEXT);
 CREATE TABLE IF NOT EXISTS web_api_cursors(root TEXT NOT NULL,cursor TEXT NOT NULL,PRIMARY KEY(root,cursor));
+CREATE TABLE IF NOT EXISTS web_publisher_licenses(
+ url TEXT PRIMARY KEY,name TEXT,body BLOB,etag TEXT,modified TEXT,next_check REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS web_publisher_copies(
+ root TEXT NOT NULL,url TEXT NOT NULL,license_url TEXT NOT NULL,body BLOB NOT NULL,
+ PRIMARY KEY(root,url));
+CREATE INDEX IF NOT EXISTS web_copy_license ON web_publisher_copies(license_url);
 """
 _NATIVE = ("starcitizen.tools", "robertsspaceindustries.com")
 _BLOCKED_NAMESPACE = re.compile(r"(?:^|/)(?:special|user(?:_talk)?|talk|file|image|mediawiki|template)(?::|%3a)", re.I)
@@ -514,6 +522,19 @@ def _reference_only(rules):
                for group in corpus.robots_groups(rules) for key, value in group)
 
 
+def _storage_policy(headers):
+    robots = headers.get("x-robots-tag", "")
+    signals = headers.get("content-signal", "")
+    denied = (re.search(r"\bno-store\b", headers.get("cache-control", ""), re.I)
+              or re.search(r"\b(?:noindex|none|noai|nosnippet)\b|max-snippet\s*:\s*0\b", robots, re.I)
+              or re.search(r"\b(?:search|ai-input)\s*=\s*no\b|\buse\s*=\s*immediate\b", signals, re.I)
+              or headers.get("use", "").strip().lower() == "immediate")
+    excerpt = (re.search(r"\bnoarchive\b", robots, re.I)
+               or re.search(r"\buse\s*=\s*reference\b", signals, re.I)
+               or headers.get("use", "").strip().lower() == "reference")
+    return bool(denied), bool(excerpt)
+
+
 class _Page(HTMLParser):
     def __init__(self, body):
         super().__init__(convert_charrefs=True)
@@ -525,6 +546,8 @@ class _Page(HTMLParser):
         self._paragraph, self._paragraph_region = [], 0
         self._current_region = 0
         self.title, self.canonical, self.license, self.denied = "", None, None, False
+        self.license_links = set()
+        self._license_anchor = None
         self.edit_uri = None
         self.no_full_text = False
         self.complete = False
@@ -578,6 +601,11 @@ class _Page(HTMLParser):
             self._flush_paragraph()
             self._paragraph_region = region
         if tag == "meta":
+            directive = a.get("http-equiv", "").lower()
+            if directive in {"cache-control", "x-robots-tag", "content-signal"}:
+                denied, excerpt = _storage_policy({directive: a.get("content", "")})
+                self.denied |= denied
+                self.no_full_text |= excerpt
             if a.get("property") == "og:title":
                 self.title = a.get("content", "")[:256]
             if a.get("name", "").lower() in {"robots", "googlebot"}:
@@ -595,11 +623,19 @@ class _Page(HTMLParser):
                 self.edit_uri = href
             # A publisher footer or explicit license relation is a declaration,
             # unlike an arbitrary Creative Commons link quoted in an article.
-            license_context = "license" in rel or "license" in marker or "copyright" in marker or any(
-                "footer" in item[2] or "copyright" in item[2] or "license" in item[2] for item in self.stack)
+            outside_article = not any(item[0] in {"article", "main", "script", "style", "form", "nav"}
+                                      or item[3] > 0 for item in self.stack)
+            footer = any(item[0] == "footer" or "copyright" in item[2] for item in self.stack)
+            document_relation = tag == "link" and "license" in rel and any(item[0] == "head" for item in self.stack)
+            license_context = outside_article and (document_relation or footer)
             match = _LICENSE.fullmatch(href)
             if license_context and match:
                 self.license = ("CC0-1.0" if match[3] else "CC-" + match[1].upper() + "-" + match[2])
+            elif license_context and href:
+                if "license" in rel:
+                    self.license_links.add(href)
+                elif tag == "a":
+                    self._license_anchor = (href, [])
             if (tag == "a" and href and "nofollow" not in rel
                     and not any(item[0] in {"form", "script", "style", "noscript"} for item in self.stack)):
                 # Navigation can be the only path to a section. Its text stays
@@ -611,6 +647,12 @@ class _Page(HTMLParser):
             self.stack.append((tag, blocked, tag + " " + marker, region))
 
     def handle_endtag(self, tag):
+        if tag == "a" and self._license_anchor is not None:
+            href, parts = self._license_anchor
+            label = " ".join("".join(parts).split())
+            if re.fullmatch(r"(?:GNU Free Documentation License|GFDL)(?:\s+v?(?:ersion )?1\.[123])?|License", label, re.I):
+                self.license_links.add(href)
+            self._license_anchor = None
         if tag == "p":
             self._flush_paragraph()
         if tag in {"p", "li", "h1", "h2", "h3", "h4", "dt", "dd", "pre", "td", "article", "main"}:
@@ -628,6 +670,8 @@ class _Page(HTMLParser):
             self.complete = not self.incomplete and not any(item[0] in {"article", "main"} for item in self.stack)
 
     def handle_data(self, data):
+        if self._license_anchor is not None:
+            self._license_anchor[1].append(data)
         if self.stack and not self.stack[-1][1]:
             if self.stack[-1][0] == "title":
                 if not self.title:
@@ -769,7 +813,108 @@ def _purge(db, root, url, status, observed_at=None):
     if status == "blocked" and prior and prior[0] != "blocked" and observed_at:
         corpus.record_source_change(db, url, observed_at, "web_storage_denied")
     db.execute("DELETE FROM web_passages WHERE root=? AND url=?", (root, url))
+    _remove_original(db, root, url)
     db.execute("UPDATE web_pages SET status=?,storage_mode=NULL,content_sha256=NULL WHERE root=? AND url=?", (status, root, url))
+
+
+def _remove_original(db, root, url):
+    row = db.execute("SELECT license_url FROM web_publisher_copies WHERE root=? AND url=?", (root, url)).fetchone()
+    if row:
+        db.execute("DELETE FROM web_publisher_copies WHERE root=? AND url=?", (root, url))
+        db.execute("""DELETE FROM web_publisher_licenses WHERE url=? AND NOT EXISTS
+                      (SELECT 1 FROM web_publisher_copies WHERE license_url=?)""", (row[0], row[0]))
+
+
+def _restrict_article(db, url, observed, *, full_only):
+    for root, mode in db.execute("SELECT root,storage_mode FROM web_pages WHERE url=? AND status='indexed'",
+                                 (url,)).fetchall():
+        if not full_only or mode == "full_text":
+            _purge(db, root, url, "pending" if full_only else "blocked", observed)
+            db.execute("UPDATE web_pages SET etag=NULL,last_modified=NULL,next_attempt=0 WHERE root=? AND url=?",
+                       (root, url))
+
+
+def _header_license_links(headers):
+    links = set()
+    for href, params in re.findall(r"<([^<>]+)>([^<>]*?)(?=,\s*<|$)", headers.get("link", "")):
+        rel = re.search(r'(?:^|;)\s*rel\s*=\s*(?:"([^"]*)"|([^;,\s]+))', params, re.I)
+        if rel and "license" in (rel[1] or rel[2]).lower().split():
+            links.add(href)
+    return links
+
+
+def _license_link(declarations, article_url):
+    if len(declarations) != 1:
+        return None
+    try:
+        url = _url(urljoin(article_url, next(iter(declarations))))
+    except ValueError:
+        return None
+    parts = urlsplit(url)
+    if parts.netloc != urlsplit(article_url).netloc or _ADMIN.search(unquote(parts.path)):
+        return None
+    return url
+
+
+def _discard_publisher_copies(db, license_url, now):
+    observed = datetime.fromtimestamp(now, UTC).isoformat(timespec="microseconds")
+    for root, url in db.execute("SELECT root,url FROM web_publisher_copies WHERE license_url=?",
+                                (license_url,)).fetchall():
+        _purge(db, root, url, "pending")
+        db.execute("""UPDATE web_pages SET next_attempt=0,etag=NULL,last_modified=NULL
+                      WHERE root=? AND url=?""", (root, url))
+        corpus.record_source_change(db, url, observed, "web_storage_changed")
+
+
+def _publisher_license(contact, url, rules):
+    db, now = contact.db, contact.clock()
+    cached = db.execute("SELECT name,etag,modified,next_check FROM web_publisher_licenses WHERE url=?",
+                        (url,)).fetchone()
+    permitted = _allowed(rules, url) and not _reference_only(rules)
+    if permitted and cached and cached[3] > now:
+        return cached[0]
+    name, original, etag, modified = None, None, None, None
+    if permitted:
+        headers = _conditional(cached[1], cached[2]) if cached and cached[0] else {}
+        try:
+            response = contact.get(url, rules=rules, headers=headers)
+            deny, excerpt = _storage_policy(response.headers)
+            if not (deny or excerpt):
+                if response.status == 304 and headers:
+                    with db:
+                        db.execute("UPDATE web_publisher_licenses SET next_check=? WHERE url=?", (now+86400, url))
+                    return cached[0]
+                if response.status == 200:
+                    raw = _payload(response, 1_000_000)
+                    media_type = response.headers.get("content-type", "text/html").split(";", 1)[0].strip().lower()
+                    if media_type == "text/plain":
+                        name = gfdl_license([raw.decode("utf-8-sig")])
+                    elif media_type in ("text/html", "application/xhtml+xml"):
+                        page = _Page(raw.decode("utf-8-sig"))
+                        if not (page.denied or page.no_full_text):
+                            if not page.complete:
+                                raise ValueError("Incomplete publisher license response")
+                            name = gfdl_license(page.blocks)
+                    if name:
+                        original = zlib.compress(raw)
+                        etag, modified = response.headers.get("etag"), response.headers.get("last-modified")
+                elif response.status >= 500:
+                    raise OSError("Publisher license service unavailable")
+        except (_Cooldown, OSError, ValueError, http.client.HTTPException) as error:
+            retry = error.until if isinstance(error, _Cooldown) else now+900
+            with db:
+                db.execute("""INSERT INTO web_publisher_licenses(url,next_check) VALUES(?,?)
+                              ON CONFLICT(url) DO UPDATE SET next_check=excluded.next_check""", (url, retry))
+            return cached[0] if cached else None
+    with db:
+        if cached and cached[0] and cached[0] != name:
+            _discard_publisher_copies(db, url, now)
+        db.execute("""INSERT OR REPLACE INTO web_publisher_licenses(url,name,body,etag,modified,next_check)
+                      VALUES(?,?,?,?,?,?)""", (url, name, original, etag, modified, now+86400))
+        if name and (not cached or not cached[0]):
+            db.execute("""UPDATE web_pages SET next_attempt=0,etag=NULL,last_modified=NULL
+                          WHERE license_url=? AND storage_mode='short_excerpt'""", (url,))
+    return name
 
 
 def refresh_web_sources(db_path, roots, *, batch_size=5, stop_event=None,
@@ -795,6 +940,12 @@ def refresh_web_sources(db_path, roots, *, batch_size=5, stop_event=None,
             db.execute("ALTER TABLE web_roots ADD COLUMN discovery_retry REAL NOT NULL DEFAULT 0")
             db.commit()
         page_columns = {r[1] for r in db.execute("PRAGMA table_info(web_pages)")}
+        if "license_url" not in page_columns:
+            with db:
+                db.execute("ALTER TABLE web_pages ADD COLUMN license_url TEXT")
+                # Earlier versions did not save declarations on reference-only pages.
+                db.execute("""UPDATE web_pages SET next_attempt=0,etag=NULL,last_modified=NULL
+                              WHERE storage_mode='short_excerpt' AND status='indexed'""")
         if "redirect_url" not in page_columns:
             db.execute("ALTER TABLE web_pages ADD COLUMN redirect_url TEXT")
             db.commit()
@@ -818,6 +969,23 @@ def refresh_web_sources(db_path, roots, *, batch_size=5, stop_event=None,
             try:
                 rules = contact.robots(root)
                 observed = datetime.fromtimestamp(_clock(), UTC).isoformat(timespec="microseconds")
+                host_prefix = "https://" + urlsplit(root).netloc + "/"
+                # Reconcile known robots changes immediately, even when the article
+                # or its linked license would otherwise wait for a weekly revisit.
+                for (license_url,) in db.execute("""SELECT url FROM web_publisher_licenses
+                        WHERE name IS NOT NULL AND instr(url,?)=1""", (host_prefix,)).fetchall():
+                    if _reference_only(rules) or not _allowed(rules, license_url):
+                        _publisher_license(contact, license_url, rules)
+                with db:
+                    for (stored_url,) in db.execute("""SELECT DISTINCT url FROM web_publisher_copies
+                            WHERE instr(url,?)=1""", (host_prefix,)).fetchall():
+                        if not _allowed(rules, stored_url):
+                            _restrict_article(db, stored_url, observed, full_only=False)
+                due_license = db.execute("""SELECT l.url FROM web_publisher_licenses l
+                    JOIN web_pages p ON p.license_url=l.url WHERE p.root=? AND l.next_check<=?
+                    ORDER BY l.next_check,l.url LIMIT 1""", (root, _clock())).fetchone()
+                if due_license:
+                    _publisher_license(contact, due_license[0], rules)
                 with db:
                     reference_only = _reference_only(rules)
                     for url, mode in db.execute("SELECT url,storage_mode FROM web_pages WHERE root=? AND status='indexed'", (root,)).fetchall():
@@ -885,7 +1053,8 @@ def refresh_web_sources(db_path, roots, *, batch_size=5, stop_event=None,
                 prefer = db.execute("SELECT prefer_existing FROM web_roots WHERE root=?", (root,)).fetchone()[0]
                 row = None
                 for group in (prefer, 1-prefer):
-                    row = db.execute("""SELECT url,etag,last_modified,content_sha256,status,redirect_url,links_scanned FROM web_pages
+                    row = db.execute("""SELECT url,etag,last_modified,content_sha256,status,redirect_url,links_scanned,
+                        license_url,storage_mode FROM web_pages
                         WHERE root=? AND (retrieved_at IS NOT NULL)=? AND next_attempt<=?
                         AND NOT (status='indexed' AND links_scanned=1 AND next_attempt>0 AND next_attempt>?
                             AND last_error IS NULL AND EXISTS (
@@ -901,7 +1070,7 @@ def refresh_web_sources(db_path, roots, *, batch_size=5, stop_event=None,
                         break
                 if not row:
                     continue
-                url, etag, modified, old_hash, old_status, old_redirect, links_scanned = row
+                url, etag, modified, old_hash, old_status, old_redirect, links_scanned, old_license_url, old_mode = row
                 now = _clock()
                 observed = datetime.fromtimestamp(now, UTC).isoformat(timespec="microseconds")
                 with db:
@@ -917,11 +1086,18 @@ def refresh_web_sources(db_path, roots, *, batch_size=5, stop_event=None,
                         with db:
                             _purge(db, root, url, "blocked", observed)
                         raise _Denied("robots_disallowed")
-                    conditional = _conditional(etag, modified) if old_status == "indexed" and links_scanned else {}
+                    conditional = (_conditional(etag, modified) if old_status == "indexed" and links_scanned
+                                   and not (old_license_url and old_mode == "short_excerpt") else {})
                     response = contact.get(url, rules=rules, headers=conditional)
                     header_signals = response.headers.get("x-robots-tag", "")
-                    if re.search(r"\b(?:noindex|none|noai|nosnippet)\b|max-snippet\s*:\s*0\b", header_signals, re.I):
+                    deny_storage, header_excerpt = _storage_policy(response.headers)
+                    if deny_storage:
+                        with db:
+                            _restrict_article(db, url, observed, full_only=False)
                         raise _Denied("publisher_storage_denied")
+                    if header_excerpt:
+                        with db:
+                            _restrict_article(db, url, observed, full_only=True)
                     if response.status in (301, 302, 303, 307, 308):
                         target = _article(root, urljoin(url, response.headers.get("location", "")))
                         if not target or target == url:
@@ -941,8 +1117,15 @@ def refresh_web_sources(db_path, roots, *, batch_size=5, stop_event=None,
                             db.execute("UPDATE web_pages SET status='removed',retrieved_at=?,next_attempt=?,last_error=NULL WHERE root=? AND url=?", (observed, now+604_800, root, url))
                         continue
                     if response.status == 304 and conditional and old_hash and old_status == "indexed":
-                        if re.search(r"\bnoarchive\b", header_signals, re.I):
+                        if header_excerpt:
                             raise _Denied("publisher_full_text_denied")
+                        declared = _header_license_links(response.headers)
+                        if declared and old_license_url and _license_link(declared, url) != old_license_url:
+                            with db:
+                                _restrict_article(db, url, observed, full_only=True)
+                            continue  # Refetch the original before accepting a new declaration.
+                        if old_license_url and old_mode == "full_text" and not _publisher_license(contact, old_license_url, rules):
+                            continue  # A changed license withdrew this cached copy.
                         with db:
                             db.execute("UPDATE web_pages SET next_attempt=?,last_error=NULL WHERE root=? AND url=?", (now+604_800, root, url))
                         continue
@@ -951,7 +1134,11 @@ def refresh_web_sources(db_path, roots, *, batch_size=5, stop_event=None,
                     content_type = response.headers.get("content-type", "text/html").split(";", 1)[0].lower()
                     if content_type not in {"text/html", "application/xhtml+xml"}:
                         raise ValueError("Wiki link is not an HTML article")
-                    page = _Page(_payload(response, 4_000_000).decode("utf-8-sig"))
+                    article_html = _payload(response, 4_000_000)
+                    page = _Page(article_html.decode("utf-8-sig"))
+                    if page.denied or page.no_full_text:
+                        with db:
+                            _restrict_article(db, url, observed, full_only=not page.denied)
                     if page.canonical and _article(root, urljoin(url, page.canonical)) is None:
                         raise _Denied("canonical_out_of_scope")
                     signals = response.headers.get("x-robots-tag", "")
@@ -982,13 +1169,23 @@ def refresh_web_sources(db_path, roots, *, batch_size=5, stop_event=None,
                     if not page.blocks or (not page.has_article_text and sum(map(len, page.blocks)) < 42):
                         raise ValueError("Public wiki page has no usable article text")
                     title = page.title or corpus.wiki_title(url)
-                    full_text = (page.license and not page.no_full_text and not _reference_only(rules)
-                                 and not re.search(r"\bnoarchive\b", signals, re.I))
+                    can_store_full = not (page.no_full_text or _reference_only(rules) or header_excerpt)
+                    declarations = page.license_links | _header_license_links(response.headers)
+                    license_url = _license_link(declarations, url)
+                    publisher_name = _publisher_license(contact, license_url, rules) if license_url and can_store_full else None
+                    page.license = publisher_name or page.license
+                    full_text = page.license and can_store_full
                     mode = "full_text" if full_text else "short_excerpt"
                     passages = ([block[start:start+1600] for block in page.blocks for start in range(0, len(block), 1600)]
                                 if full_text else [page.short_excerpt()])
                     content_hash = hashlib.sha256(json.dumps([title, page.license, passages], ensure_ascii=False).encode()).hexdigest()
                     with db:
+                        if publisher_name:
+                            db.execute("INSERT OR REPLACE INTO web_publisher_copies VALUES(?,?,?,?)",
+                                       (root, url, license_url, zlib.compress(article_html)))
+                        else:
+                            _remove_original(db, root, url)
+                        db.execute("UPDATE web_pages SET license_url=? WHERE root=? AND url=?", (license_url, root, url))
                         if old_hash and old_hash != content_hash or old_status in {"removed", "redirected", "blocked"}:
                             corpus.record_source_change(db, url, observed, "web_page_changed")
                         if old_hash != content_hash or old_status != "indexed":
@@ -1063,9 +1260,33 @@ def read_web_page(db_path, url, roots, offset=0):
         FROM web_passages w JOIN web_pages p ON p.root=w.root AND p.url=w.url
         WHERE p.url=? AND p.status='indexed' AND w.root IN (SELECT value FROM json_each(?)) AND w.ordinal>=?
         ORDER BY w.ordinal LIMIT 11""", (url, json.dumps(roots), offset))
-    return {"status": "reference" if rows else "unavailable", "citation": url,
+    result = {"status": "reference" if rows else "unavailable", "citation": url,
             "passages": rows[:10], "next_offset": rows[9]["ordinal"]+1 if len(rows) > 10 else None,
             "live_state": False}
+    if rows and (rows[0]["license"] or "").startswith("GFDL-"):
+        copies = _read(db_path, """SELECT c.license_url FROM web_publisher_copies c
+            JOIN web_publisher_licenses l ON l.url=c.license_url WHERE c.url=?
+            AND c.root IN (SELECT value FROM json_each(?)) AND l.name IS NOT NULL LIMIT 1""",
+            (url, json.dumps(roots)))
+        if copies:
+            result["publisher_license_url"] = copies[0]["license_url"]
+    return result
+
+
+def read_publisher_copy(db_path, url, roots):
+    """Read exact original HTML and its complete license locally, without rendering either."""
+    roots = _roots(roots)
+    if not any(_article(root, url) == url for root in roots):
+        return None
+    rows = _read(db_path, """SELECT c.body AS article,l.body AS terms,c.license_url,l.name FROM web_publisher_copies c
+        JOIN web_pages p ON p.root=c.root AND p.url=c.url JOIN web_publisher_licenses l ON l.url=c.license_url
+        WHERE c.url=? AND c.root IN (SELECT value FROM json_each(?)) AND p.status='indexed'
+        AND p.storage_mode='full_text' AND p.license=l.name AND l.body IS NOT NULL LIMIT 1""", (url, json.dumps(roots)))
+    if not rows:
+        return None
+    row = rows[0]
+    return {"citation": url, "license": row["name"], "license_url": row["license_url"],
+            "article_html": zlib.decompress(row["article"]), "license_document": zlib.decompress(row["terms"])}
 
 
 def web_coverage(db_path, roots):

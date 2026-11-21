@@ -389,6 +389,8 @@ def _policy_denial(headers, cached_policy: str = "") -> str | None:
                        headers.get("x-robots-tag", ""), headers.get("use", "")))
     if re.search(r"\b(?:noarchive|noai)\b", policy, re.I):
         return "noarchive_or_noai"
+    if headers.get("use", "").strip().lower() == "immediate" or re.search(r"\buse\s*=\s*immediate\b", policy, re.I):
+        return "immediate_only"
     if headers.get("use", "").lower().strip() == "reference" or re.search(r"(?:^|[,;\s])use\s*=\s*reference\b", policy, re.I):
         return "reference_only"
     if re.search(r"\bai-input\s*=\s*no\b", policy, re.I):
