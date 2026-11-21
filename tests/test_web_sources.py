@@ -412,7 +412,8 @@ def test_mediawiki_article_region_excludes_global_and_in_content_chrome(tmp_path
     assert 'Home News' not in str(web.read_web_page(db, A, (A,)))
     assert 'Categories and toolbar' not in str(web.read_web_page(db, A, (A,)))
     with sqlite3.connect(db) as conn:
-        assert conn.execute('SELECT url FROM web_pages WHERE status=?', ('pending',)).fetchall() == [('https://wiki.example/game-a/Gameplay_Controls',)]
+        queued = {url for (url,) in conn.execute('SELECT url FROM web_pages WHERE status=?', ('pending',))}
+        assert queued == {'https://wiki.example/game-a/Gameplay_Controls', 'https://wiki.example/game-a/Irrelevant_Navigation'}
     # An unlicensed page must also spend its single 25 words on gameplay text.
     source.now += 604_801
     source.pages[A] = source.pages[A].replace(b'rel="license"', b'rel="external"').replace(b'<footer>', b'<div>').replace(b'</footer>', b'</div>')

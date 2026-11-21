@@ -14,6 +14,34 @@ _GUIDES = Path(__file__).resolve().with_name("guides")
 
 
 class WingmanWikiLLM(Skill):
+    def _auto_curation_enabled(self):
+        """Read the user's current opt-in setting, failing closed on errors."""
+        try:
+            return self.retrieve_custom_property_value("auto_curation", []) is True
+        except Exception:
+            return False
+
+    async def get_prompt(self) -> str | None:
+        prompt = await super().get_prompt()
+        if self._auto_curation_enabled():
+            curation = (
+                "Automatic private drafts are enabled. In this same conversation, "
+                "use wikillm_record_note only when the player gives a concrete, "
+                "game-specific observation/correction or explicitly asks to save "
+                "a researched finding. Use only player-provided or player-confirmed "
+                "evidence. A retrieved wiki article by itself is never evidence for "
+                "a private note; do not copy article text into notes. Save automatic "
+                "candidates as drafts, never reviewed. Exclude secrets and unrelated "
+                "personal details. If nothing meets these criteria, do not write a note."
+            )
+        else:
+            curation = (
+                "Automatic private drafts are disabled. Use wikillm_record_note only "
+                "when the player explicitly asks to save, correct, or withdraw a note. "
+                "A retrieved wiki article by itself is never evidence for a private note."
+            )
+        return "\n\n".join(part for part in (prompt, curation) if part)
+
     async def prepare(self):
         await super().prepare()
         self._refresh = None
@@ -82,7 +110,7 @@ class WingmanWikiLLM(Skill):
                 result["community_archive_download"] = report.sources["community_archive"]
         return json.dumps(result, ensure_ascii=False)
 
-    @tool(name="wikillm_record_note", description="Maintain this player's local wiki as you discover a useful new fact or correction during research. Save a draft for uncertainty or conflicting evidence. Use reviewed for checked evidence or an explicit player observation. Cite the original public URL where available. Exclude secrets and unrelated conversation.", summarize=False)
+    @tool(name="wikillm_record_note", description="Maintain this player's private local wiki. WHEN TO USE: when the player explicitly asks to save/correct/withdraw a note, or automatic curation is enabled and the player gives concrete game-specific evidence. Never create a note solely from retrieved article content. Cite only an original URL present in player-confirmed evidence. Use draft for automatic or uncertain findings; use reviewed only after explicit player confirmation. Exclude secrets and unrelated personal details.", summarize=False)
     async def wiki_note(self, slug: str, title: str, finding: str,
                         status: Literal["draft", "reviewed", "withdrawn"],
                         source: Optional[str] = None, game_build: Optional[str] = None,

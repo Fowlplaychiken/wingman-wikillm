@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import gzip
+import hashlib
+import io
 import json
 import math
 import os
@@ -32,12 +35,16 @@ SITEMAPS = (
     f"{RSI}/sitemap.xml",
 )
 GALACTAPEDIA = f"{RSI}/galactapedia"
+# Maximum uncompressed size of one sitemap in the publisher protocol.
+SITEMAP_LIMIT = 52_428_800
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS wiki_urls(url TEXT PRIMARY KEY, lastmod TEXT,
     pageid INTEGER, checked_at TEXT, status TEXT NOT NULL DEFAULT 'pending');
 CREATE TABLE IF NOT EXISTS catalog_titles(url TEXT PRIMARY KEY, title TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS source_changes(url TEXT PRIMARY KEY,
     observed_at TEXT NOT NULL, reason TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS wiki_http_cache(url TEXT PRIMARY KEY,etag TEXT,modified TEXT,
+    digest TEXT,sitemap TEXT);
 CREATE TABLE IF NOT EXISTS pages(pageid INTEGER PRIMARY KEY, title TEXT, revision INTEGER,
     timestamp TEXT, wikitext TEXT, extract TEXT);
 CREATE TABLE IF NOT EXISTS page_sources(pageid INTEGER PRIMARY KEY, url TEXT UNIQUE NOT NULL,
@@ -141,23 +148,46 @@ class Publisher:
             self.request_started(host, phase or contact_phase(url))
 
     def _get(self, url: str, limit: int, body: bytes | None = None) -> str:
+        text, _, _ = self._request(url, limit, body, {})
+        return text
+
+    def _request(self, url, limit, body, conditional):
         self._pace(url)
-        headers = {"User-Agent": AGENT}
+        headers = {"User-Agent": AGENT, **conditional}
         if body is not None:
             headers["Content-Type"] = "application/json"
         host, phase = urlsplit(url).netloc, contact_phase(url)
         try:
             with self.opener.open(Request(url, data=body, headers=headers), timeout=15) as response:
                 data = response.read(limit + 1)
+                etag = response.headers.get("ETag")
+                modified = response.headers.get("Last-Modified")
             self.check_cancelled()
             if len(data) > limit:
                 raise ValueError("publisher response too large")
-            return data.decode("utf-8")
+            if data.startswith(b"\x1f\x8b"):
+                with gzip.GzipFile(fileobj=io.BytesIO(data)) as archive:
+                    data = archive.read(limit + 1)
+                if len(data) > limit:
+                    raise ValueError("expanded publisher response too large")
+            return data.decode("utf-8-sig"), etag, modified
         except RefreshCancelled:
             raise
         except Exception as exc:
+            if isinstance(exc, HTTPError) and exc.code == 304 and conditional:
+                exc.close()
+                return None, None, None
             self._record_failure(host, phase, exc)
             raise
+
+    def conditional_get(self, url, limit, etag, modified):
+        if type(self).get is not Publisher.get:
+            # Existing publisher adapters may implement their own transport.
+            return self.get(url, limit), None, None
+        if not self.allowed(url):
+            raise PermissionError(f"publisher robots.txt excludes {url}")
+        conditional = {k: v for k, v in (("If-None-Match", etag), ("If-Modified-Since", modified)) if v}
+        return self._request(url, limit, None, conditional)
 
     def _record_failure(self, host: str, phase: str, exc: Exception) -> None:
         status = exc.code if isinstance(exc, HTTPError) else None
@@ -337,11 +367,21 @@ def indexable(url: str) -> bool:
     )
 
 
-def sitemap_entries(source: Publisher, url: str, seen: set[str]):
+def sitemap_entries(source: Publisher, url: str, seen: set[str], db=None):
     if url in seen:
         return
     seen.add(url)
-    raw = source.get(url, 16_000_000)
+    cacheable = db is not None and hasattr(source, "conditional_get")
+    if cacheable:
+        prior = db.execute("SELECT etag,modified,sitemap FROM wiki_http_cache WHERE url=?", (url,)).fetchone()
+        raw, etag, modified = source.conditional_get(url, SITEMAP_LIMIT, *(prior[:2] if prior else (None, None)))
+        unchanged = raw is None
+        if unchanged:
+            if not prior or not prior[2]:
+                raise ValueError("publisher returned 304 without a cached sitemap")
+            raw = prior[2]
+    else:
+        raw = source.get(url, SITEMAP_LIMIT)
     if re.search(r"<!\s*(?:DOCTYPE|ENTITY)", raw, re.I):
         raise ValueError("sitemap cannot contain a DTD")
     feed = ElementTree.fromstring(raw)
@@ -351,9 +391,9 @@ def sitemap_entries(source: Publisher, url: str, seen: set[str]):
             location = child.findtext("s:loc", namespaces=ns)
             if location and "/spectrum/" in location:
                 continue
-            if not location or not location.endswith(".xml"):
+            if not location or not location.endswith((".xml", ".xml.gz")):
                 raise ValueError("unsupported or incomplete child sitemap")
-            yield from sitemap_entries(source, location, seen)
+            yield from sitemap_entries(source, location, seen, db)
     elif feed.tag.endswith("}urlset"):
         for row in feed.findall("s:url", ns):
             loc = row.findtext("s:loc", namespaces=ns)
@@ -365,6 +405,10 @@ def sitemap_entries(source: Publisher, url: str, seen: set[str]):
                 yield loc, row.findtext("s:lastmod", namespaces=ns)
     else:
         raise ValueError(f"unrecognized sitemap: {url}")
+    if cacheable and not unchanged:
+        with db:
+            db.execute("""INSERT OR REPLACE INTO wiki_http_cache(url,etag,modified,sitemap)
+                VALUES(?,?,?,?)""", (url, etag, modified, raw))
 
 
 class ArticleElement(NamedTuple):
@@ -470,10 +514,12 @@ def apply_catalog(db, name, records, observed_at):
             LEFT JOIN catalog_titles t ON t.url=u.url""") if catalog_owner(url) == name}
     has_page_queue = name == "community" and db.execute(
         "SELECT 1 FROM sqlite_master WHERE name='refresh_pages'").fetchone()
+    changed_titles = set()
     for url in existing.keys() - records.keys():
         if existing[url][2] != "removed":
             record_source_change(db, url, observed_at, "catalog_url_removed")
-        db.execute("UPDATE wiki_urls SET status='removed' WHERE url=?", (url,))
+            changed_titles.add(url)
+            db.execute("UPDATE wiki_urls SET status='removed' WHERE url=?", (url,))
     for url, value in records.items():
         old = existing.get(url)
         modified = None if name == "galactapedia" else value
@@ -485,22 +531,36 @@ def apply_catalog(db, name, records, observed_at):
             elif old[0] != modified:
                 record_source_change(db, url, observed_at, "publisher_metadata_changed")
         status = "indexed" if old and old[1] is not None else ("pending" if name == "community" else "catalog")
-        db.execute("""INSERT INTO wiki_urls(url,lastmod,status) VALUES(?,?,?)
-            ON CONFLICT(url) DO UPDATE SET lastmod=excluded.lastmod,status=excluded.status""", (url, modified, status))
-        if name == "galactapedia":
+        if not old or old[0] != modified or old[2] != status:
+            db.execute("""INSERT INTO wiki_urls(url,lastmod,status) VALUES(?,?,?)
+                ON CONFLICT(url) DO UPDATE SET lastmod=excluded.lastmod,status=excluded.status""", (url, modified, status))
+        if not old or old[2] == "removed":
+            changed_titles.add(url)
+        if name == "galactapedia" and (not old or old[3] != value):
+            changed_titles.add(url)
             db.execute("INSERT OR REPLACE INTO catalog_titles VALUES(?,?)", (url, value))
         if name == "community" and (old is None or old[0] != modified or old[2] == "removed"):
             # Do not require refresh.py's auxiliary schema for the standalone CLI.
             if has_page_queue:
                 db.execute("""INSERT INTO refresh_pages(url,next_attempt) VALUES(?,0)
                     ON CONFLICT(url) DO UPDATE SET next_attempt=0""", (url,))
-    rebuild_catalog(db)
+    if not db.execute("SELECT 1 FROM catalog_search LIMIT 1").fetchone():
+        rebuild_catalog(db)
+    elif changed_titles:
+        changed = json.dumps(sorted(changed_titles))
+        db.execute("DELETE FROM catalog_search WHERE url IN (SELECT value FROM json_each(?))", (changed,))
+        db.executemany("INSERT INTO catalog_search VALUES(?,?,?)", (
+            (url, title or wiki_title(url), publisher_name(url)) for url, title in
+            db.execute("""SELECT u.url,coalesce(p.title,t.title) FROM wiki_urls u
+                LEFT JOIN pages p ON p.pageid=u.pageid LEFT JOIN catalog_titles t ON t.url=u.url
+                WHERE u.url IN (SELECT value FROM json_each(?)) AND u.status!='removed'""", (changed,))
+        ))
 
 
 def discover(db: sqlite3.Connection, publisher: Publisher) -> int:
     discovered: dict[str, str | None] = {}
     for sitemap in SITEMAPS:
-        discovered.update(sitemap_entries(publisher, sitemap, set()))
+        discovered.update(sitemap_entries(publisher, sitemap, set(), db))
     lore = dict(publisher.galactapedia())
     with db:
         observed_at = datetime.now(UTC).isoformat(timespec="microseconds")
@@ -634,7 +694,23 @@ def crawl(
             )
         checked = observed_at or datetime.now(UTC).isoformat(timespec="microseconds")
         try:
-            article = Article(publisher.get(url))
+            if hasattr(publisher, "conditional_get"):
+                prior = db.execute("""SELECT h.etag,h.modified,h.digest FROM wiki_http_cache h
+                    JOIN wiki_urls u ON u.url=h.url WHERE h.url=? AND u.status='indexed'
+                    AND u.pageid IS NOT NULL""", (url,)).fetchone()
+                raw, etag, modified = publisher.conditional_get(url, 4_000_000, *(prior[:2] if prior else (None, None)))
+                if raw is None:
+                    if prior is None:
+                        raise ValueError("publisher returned 304 without a cached article")
+                    continue
+                digest = hashlib.sha256(raw.encode()).hexdigest()
+                if prior and digest == prior[2]:
+                    with db:
+                        db.execute("UPDATE wiki_http_cache SET etag=?,modified=? WHERE url=?", (etag, modified, url))
+                    continue
+            else:
+                raw = publisher.get(url)
+            article = Article(raw)
         except HTTPError as exc:
             if exc.code not in {404, 410}:
                 raise ValueError(f"HTTP {exc.code} at {url}") from exc
@@ -661,6 +737,9 @@ def crawl(
         origin = publisher_name(url)
         terms = " ".join(sorted(article.vocabulary))
         with db:
+            if hasattr(publisher, "conditional_get"):
+                db.execute("""INSERT OR REPLACE INTO wiki_http_cache(url,etag,modified,digest)
+                    VALUES(?,?,?,?)""", (url, etag, modified, digest))
             row = db.execute("""SELECT p.pageid,p.title,p.revision,p.timestamp,p.extract,v.terms
                 FROM page_sources s JOIN pages p ON p.pageid=s.pageid
                 LEFT JOIN page_vocabulary v ON v.rowid=p.pageid WHERE s.url=?""", (url,)).fetchone()
