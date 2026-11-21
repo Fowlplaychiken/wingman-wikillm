@@ -6,6 +6,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urldefrag, urlsplit
 
+from . import corpus
+from .coverage import full_pages, verify_inventory
+from .snapshots import read_snapshot_page, search_snapshots
+from .web_sources import in_scope, read_web_page, search_web_sources, web_coverage
 from .reference import WikiReference, _build_key, _query_terms, community_db_path
 
 _SCHEMA = """
@@ -50,7 +54,7 @@ def record_note(slug, title, finding, *, status, source=None, game_build=None,
             raise ValueError(f"This topic is at revision {current}. Read its history before editing.")
         revision = current + 1
         db.execute("INSERT INTO note_revisions VALUES(?,?,?,?,?,?,?,?)", (
-            slug, revision, datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            slug, revision, datetime.now(timezone.utc).isoformat(timespec="microseconds"),
             title.strip(), finding.strip(), source or None, game_build or None, status))
         if status != "draft":
             db.execute("DELETE FROM current_notes WHERE slug=?", (slug,))
@@ -82,22 +86,97 @@ def _source_changes(references, db_path):
         urls = {urldefrag(url)[0] for url in ref.get("source_links", [])}
         if ref.get("citation", "") and ref["citation"].startswith("https://"):
             urls.add(urldefrag(ref["citation"])[0])
-        stamp = (ref.get("reviewed") or ref.get("recorded_at") or "")[:10]
+        stamp = ref.get("reviewed") or ref.get("recorded_at") or ""
         if not urls or not stamp:
             continue
         slots = ",".join("?" for _ in urls)
         evidence = _read(db_path, f"SELECT url,lastmod,status FROM wiki_urls WHERE url IN ({slots})",
                          tuple(urls), "wiki_urls")
         changes = [row for row in evidence if row["status"] == "removed"
-                   or (row["lastmod"] or "")[:10] > stamp]
+                   or (row["lastmod"] or "")[:10] > stamp[:10]]
+        for row in _read(db_path, f"SELECT url,observed_at,reason FROM source_changes WHERE url IN ({slots})",
+                         tuple(urls), "source_changes"):
+            if row["observed_at"] > stamp:
+                changes.append(row)
         if changes:
             ref["needs_review"] = True
             ref["changed_sources"] = changes
 
 
-def lookup(guides: Path, query: str, game_build=None, db_path=None):
+def _selected(url, include_star_citizen, roots):
+    if not isinstance(url, str) or not url.startswith("https://"):
+        return False
+    return (include_star_citizen and corpus.indexable(url)) or any(in_scope(url, root) for root in roots)
+
+
+def read_page(db_path, url, *, offset=0, include_star_citizen=True, roots=()):
+    """Read an article from the currently enabled local sources."""
+    if type(offset) is not int or offset < 0:
+        raise ValueError("Use an offset returned by the previous read.")
+    if not isinstance(url, str):
+        return {"status": "unavailable"}
+    permanent = re.fullmatch(r"https://starcitizen\.tools/index\.php\?oldid=([1-9][0-9]{0,17})", url or "")
+    selected = _selected(url, include_star_citizen, roots)
+    if not selected and not (include_star_citizen and permanent):
+        return {"status": "unavailable"}
+    if selected:
+        saved = read_snapshot_page(community_db_path(db_path), url, offset)
+        if saved["status"] != "not_found":
+            return saved
+    if include_star_citizen and (permanent or corpus.indexable(url)):
+        # A community citation may refer to an exact revision with a bounded cached excerpt.
+        cached = _read(db_path, """SELECT p.title,p.extract,p.revision,s.url FROM pages p
+            JOIN page_sources s ON p.pageid=s.pageid JOIN wiki_urls u ON u.url=s.url AND u.status='indexed'
+            WHERE s.publisher='Star Citizen Wiki' AND (s.url=? OR p.revision=?) LIMIT 1""",
+            (url, int(permanent[1]) if permanent else None), "page_sources")
+        if cached:
+            item = cached[0]
+            return {"status": "reference", "citation": url, "title": item["title"],
+                    "text": item["extract"][offset:], "storage_mode": "short_excerpt",
+                    "revision": item["revision"], "next_offset": None, "live_state": False}
+    return read_web_page(community_db_path(db_path), url, roots, offset=offset)
+
+
+def check_inventory(db_path, manifest, *, include_star_citizen=True, roots=()):
+    return verify_inventory(community_db_path(db_path), manifest, lambda url: _selected(url, include_star_citizen, roots))
+
+
+def library_status(db_path=None, *, include_star_citizen=True, roots=()):
+    path = community_db_path(db_path)
+    allowed = lambda url: _selected(url, include_star_citizen, roots)
+    full = full_pages(path)
+    imports = []
+    if path.is_file():
+        with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as db:
+            if db.execute("SELECT 1 FROM sqlite_master WHERE name='snapshot_pages'").fetchone():
+                db.create_function("enabled", 1, allowed)
+                imports = [{"origin": host, "saved_articles": count} for host, count in db.execute(
+                    "SELECT source_origin,count(distinct url) FROM snapshot_pages WHERE enabled(url) GROUP BY source_origin")]
+    status = {"star_citizen_enabled": include_star_citizen, "custom_wikis": web_coverage(path, roots),
+              "imported_articles": imports}
+    for root, info in status["custom_wikis"].items():
+        discovered = _read(path, "SELECT url,status FROM web_pages WHERE root=? AND status NOT IN ('removed','redirected')",
+                           (root,), "web_pages")
+        known = len(discovered)
+        saved = sum(row["url"] in full and row["status"] != "blocked" for row in discovered)
+        info.update(known_article_urls=known, full_text_for_known_urls=saved, missing_full_text=known-saved,
+                    inventory_basis="discovered URLs only")
+    if include_star_citizen:
+        counts = {}
+        for row in _read(path, "SELECT url,pageid FROM wiki_urls WHERE status!='removed'", (), "wiki_urls"):
+            group = counts.setdefault(corpus.catalog_owner(row["url"]), {"titles": 0, "excerpts": 0, "full_text_for_known_urls": 0, "missing_full_text": 0})
+            group["titles"] += 1
+            group["excerpts"] += row["pageid"] is not None
+            group["full_text_for_known_urls"] += row["url"] in full
+            group["missing_full_text"] += row["url"] not in full
+        status.update(star_citizen_library=counts, last_updates=_read(
+            path, "SELECT name,last_success,last_error FROM refresh_catalogs ORDER BY name", (), "refresh_catalogs"))
+    return status
+
+
+def lookup(guides: Path, query: str, game_build=None, db_path=None, *, include_star_citizen=True, roots=()):
     db_path = community_db_path(db_path)
-    curated = WikiReference.search_curated(guides, query, game_build=game_build)
+    curated = WikiReference.search_curated(guides, query, game_build=game_build) if include_star_citizen else {}
     terms = _query_terms(query)
     if not terms or (game_build is not None and _build_key(game_build) is None):
         return {"status": "invalid_query", "references": [], "discovery_links": []}
@@ -114,10 +193,13 @@ def lookup(guides: Path, query: str, game_build=None, db_path=None):
         row["source_kind"] = "reviewed_local_note" if row["citation"] else "local_observation"
         row["live_state"] = False
     manual = WikiReference.search_notes(db_path.parent / "notes", query, game_build=game_build)
-    cached = WikiReference.search_community(query, db_path) if game_build is None else []
-    references = curated.get("references", []) + notes + manual + cached
+    cached = WikiReference.search_community(query, db_path) if include_star_citizen and game_build is None else []
+    articles = search_snapshots(query, db_path, allow_url=lambda url: _selected(url, include_star_citizen, roots),
+                                game_build=game_build)
+    web = search_web_sources(query, db_path, roots) if roots and game_build is None else []
+    references = curated.get("references", []) + notes + manual + articles + web + cached
     _source_changes(references, db_path)
     return {"status": "reference" if references else "no_matching_evidence",
             "references": references, "live_state": False,
-            "discovery_links": [] if references or game_build is not None else
+            "discovery_links": [] if references or game_build is not None or not include_star_citizen else
             WikiReference.search_catalog(query, db_path)}

@@ -318,3 +318,247 @@ def test_old_host_metadata_schema_migrates(tmp_path):
     with sqlite3.connect(db) as connection:
         stored = connection.execute("SELECT last_request,blocked_until,last_phase FROM refresh_hosts WHERE host='starcitizen.tools'").fetchone()
     assert stored == (999, 0, None)
+
+
+class ChangingCatalogPublisher:
+    """Independent two-publisher snapshots without any lastmod metadata."""
+    def __init__(self):
+        self.changed = False
+        self.calls = []
+        self.partial = False
+        self.community = [corpus.COMMUNITY + "/Orion", corpus.COMMUNITY + "/Retired"]
+        self.lore = [(corpus.GALACTAPEDIA + "/article/ABC123def0-orion", "Orion catalog before"),
+                     (corpus.GALACTAPEDIA + "/article/XYZ123abc0-old-slug", "Old slug catalog"),
+                     (corpus.GALACTAPEDIA + "/article/REM123abc0-retired", "Retired lore catalog")]
+
+    def allowed(self, url):
+        return True
+
+    def get(self, url, limit=0):
+        self.calls.append(url)
+        if url in corpus.SITEMAPS:
+            links = {corpus.SITEMAPS[0]: self.community,
+                     corpus.SITEMAPS[1]: [corpus.SUPPORT + "/hc/en-us/articles/12345-Help"],
+                     corpus.SITEMAPS[2]: [corpus.RSI + "/comm-link/engineering/12345-Ship"]}[url]
+            return '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">' + ''.join(
+                '<url><loc>' + link + '</loc></url>' for link in links) + '</urlset>'
+        assert url.startswith(corpus.COMMUNITY + "/"), "Official article bodies must not be requested"
+        revision = 202 if self.changed else 101
+        return ('<meta property="og:title" content="Orion unchanged title">'
+                '<script>var config={"wgRevisionId":' + str(revision) + '};</script>'
+                '<article><p>A stable short public excerpt is enough for the reference cache '
+                'while a later edit elsewhere in this page changes its revision identity.</p></article>')
+
+    def galactapedia(self):
+        for i, row in enumerate(self.lore):
+            yield row
+            if self.partial and i == 0:
+                raise ValueError("incomplete fixture catalog")
+
+    def advance(self):
+        self.changed = True
+        self.community = [corpus.COMMUNITY + "/Orion", corpus.COMMUNITY + "/New"]
+        self.lore = [(corpus.GALACTAPEDIA + "/article/ABC123def0-orion", "Orion catalog renamed"),
+                     (corpus.GALACTAPEDIA + "/article/XYZ123abc0-new-slug", "New slug catalog")]
+
+
+def test_no_lastmod_catalog_changes_and_same_title_revision_preserve_all_notes(tmp_path):
+    from wiki_llm.dependencies.wingman_wiki.library import note_history, record_note
+    from wiki_llm.dependencies.wingman_wiki.reference import WikiReference
+
+    db = tmp_path / "wiki.sqlite3"
+    source = ChangingCatalogPublisher()
+    options = dict(db_path=db, source=source.lore[0][0])
+    record_note("orion-review", "Personal Orion", "Private reviewed observation", status="reviewed", **options)
+    record_note("orion-review", "Personal Orion", "Private pending correction", status="draft", previous_revision=1, **options)
+    record_note("orion-draft", "Personal draft", "Private draft only", status="draft", **options)
+    record_note("orion-withdrawn", "Personal withdrawn", "Private former observation", status="reviewed", **options)
+    record_note("orion-withdrawn", "Personal withdrawn", "Private withdrawal", status="withdrawn", previous_revision=1, **options)
+    note_dir = tmp_path / "notes"
+    note_dir.mkdir()
+    note_file = note_dir / "personal.md"
+    note_file.write_text("Private Markdown note must survive unchanged", encoding="utf-8")
+
+    def note_snapshot():
+        with sqlite3.connect(db) as conn:
+            return (conn.execute("SELECT * FROM note_revisions ORDER BY slug,revision").fetchall(),
+                    conn.execute("SELECT rowid,* FROM current_notes ORDER BY rowid").fetchall(),
+                    note_file.read_bytes())
+
+    before = note_snapshot()
+    first = refresh.refresh_once(db, publisher=source, clock=lambda: 1000, catalog_interval=60, page_interval=120)
+    assert first.indexed == 2
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT count(*) FROM source_changes").fetchone() == (0,)
+    source.advance()
+    source.calls.clear()
+    refresh.refresh_once(db, publisher=source, clock=lambda: 1061, catalog_interval=60, page_interval=120)
+    assert corpus.COMMUNITY + "/Orion" not in source.calls  # bounded periodic revalidation, not every catalog poll
+    assert WikiReference.search_catalog("renamed", db)[0]["title"] == "Orion catalog renamed"
+    assert WikiReference.search_catalog("new slug", db)[0]["citation"].endswith("new-slug")
+    assert not WikiReference.search_catalog("retired", db)
+    refresh.refresh_once(db, publisher=source, clock=lambda: 1121, catalog_interval=60, page_interval=120)
+    with sqlite3.connect(db) as conn:
+        changes = dict(conn.execute("SELECT url,reason FROM source_changes"))
+        assert changes[corpus.GALACTAPEDIA + "/article/ABC123def0-orion"] == "catalog_title_changed"
+        assert changes[corpus.GALACTAPEDIA + "/article/XYZ123abc0-old-slug"] == "catalog_url_removed"
+        assert changes[corpus.GALACTAPEDIA + "/article/REM123abc0-retired"] == "catalog_url_removed"
+        assert changes[corpus.COMMUNITY + "/Retired"] == "catalog_url_removed"
+        assert changes[corpus.COMMUNITY + "/Orion"] == "page_revision_changed"
+        assert conn.execute("SELECT count(*) FROM wiki_urls WHERE lastmod IS NOT NULL").fetchone() == (0,)
+        observation = conn.execute("SELECT * FROM source_changes ORDER BY url").fetchall()
+        assert all(row[1].endswith("+00:00") for row in observation)
+        assert all(not row[0].startswith(corpus.RSI) for row in source.calls)
+    refresh.refresh_once(db, publisher=source, clock=lambda: 1242, catalog_interval=60, page_interval=120)
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT * FROM source_changes ORDER BY url").fetchall() == observation
+    assert note_snapshot() == before
+    assert len(note_history("orion-review", db)) == 2
+    assert [row["status"] for row in note_history("orion-withdrawn", db)] == ["withdrawn", "reviewed"]
+    assert len(before[0]) == 5 and len(before[1]) == 1
+
+
+def test_partial_catalog_does_not_remove_or_rename_last_good_snapshot(tmp_path):
+    db = tmp_path / "wiki.sqlite3"
+    source = ChangingCatalogPublisher()
+    refresh.refresh_once(db, publisher=source, clock=lambda: 1000)
+    with sqlite3.connect(db) as conn:
+        before = conn.execute("SELECT url,title FROM catalog_search WHERE publisher!='Star Citizen Wiki' ORDER BY url").fetchall()
+    source.advance()
+    source.partial = True
+    failed = refresh.refresh_once(db, publisher=source, clock=lambda: 90_000)
+    assert failed.catalogs["galactapedia"]["state"] == "failed"
+    assert failed.catalogs["community"]["state"] == "refreshed"
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT url,title FROM catalog_search WHERE publisher!='Star Citizen Wiki' ORDER BY url").fetchall() == before
+        assert conn.execute("SELECT count(*) FROM source_changes WHERE url LIKE ?", (corpus.GALACTAPEDIA + "%",)).fetchone() == (0,)
+
+
+def test_blocked_or_malformed_sitemap_row_cannot_publish_partial_removal(tmp_path):
+    db = tmp_path / "wiki.sqlite3"
+    source = ChangingCatalogPublisher()
+    refresh.refresh_once(db, publisher=source, clock=lambda: 1000)
+    source.allowed = lambda url: not url.endswith("/Retired")
+    failed = refresh.refresh_once(db, publisher=source, clock=lambda: 90_000)
+    assert failed.catalogs["community"]["state"] == "failed"
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT status FROM wiki_urls WHERE url=?", (corpus.COMMUNITY + "/Retired",)).fetchone() == ("indexed",)
+    source.allowed = lambda url: True
+    source.get = lambda url, limit=0: '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"><url/></urlset>'
+    failed = refresh.refresh_once(db, publisher=source, clock=lambda: 91_000)
+    assert failed.catalogs["community"]["state"] == "failed"
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT count(*) FROM wiki_urls WHERE status='removed'").fetchone() == (0,)
+
+
+def test_standalone_discover_tracks_removals_without_lastmod(tmp_path):
+    source = ChangingCatalogPublisher()
+    with sqlite3.connect(tmp_path / "wiki.sqlite3") as conn:
+        conn.executescript(corpus.SCHEMA)
+        corpus.discover(conn, source)
+        source.advance()
+        corpus.discover(conn, source)
+        assert conn.execute("SELECT status FROM wiki_urls WHERE url=?", (corpus.COMMUNITY + "/Retired",)).fetchone() == ("removed",)
+        prior = conn.execute("SELECT * FROM source_changes ORDER BY url").fetchall()
+        assert prior
+        corpus.discover(conn, source)
+        assert conn.execute("SELECT * FROM source_changes ORDER BY url").fetchall() == prior
+
+
+def test_enabled_catalogs_disable_network_but_preserve_sources_and_notes(tmp_path):
+    from wiki_llm.dependencies.wingman_wiki.library import record_note
+    db = tmp_path / "wiki.sqlite3"
+    class Selected(ChangingCatalogPublisher):
+        def galactapedia(self):
+            self.calls.append("galactapedia")
+            yield from super().galactapedia()
+    source = Selected()
+    refresh.refresh_once(db, publisher=source, clock=lambda: 1000, page_interval=60)
+    record_note("local-note", "Local note", "Personal persistent observation", status="reviewed", db_path=db)
+    with sqlite3.connect(db) as conn:
+        def snapshot():
+            return [conn.execute("SELECT * FROM " + table + " ORDER BY rowid").fetchall()
+                    for table in ("wiki_urls", "pages", "page_sources", "catalog_titles", "note_revisions", "current_notes")]
+        before = snapshot()
+        source.calls.clear()
+        disabled = refresh.refresh_once(db, publisher=source, clock=lambda: 90_000, enabled_catalogs=[])
+        assert source.calls == [] and disabled.indexed == 0
+        assert all(value == {"state": "disabled"} for value in disabled.catalogs.values())
+        assert snapshot() == before
+    only_lore = refresh.refresh_once(db, publisher=source, clock=lambda: 90_001,
+                                   enabled_catalogs=(name for name in ["galactapedia"]))
+    assert source.calls == ["galactapedia"] and only_lore.indexed == 0
+    assert only_lore.coverage["community"]["indexed_pages"] == 2
+    source.calls.clear()
+    only_community = refresh.refresh_once(db, publisher=source, clock=lambda: 90_002,
+                                        page_interval=60, enabled_catalogs=["community"])
+    assert only_community.indexed == 2
+    assert source.calls == [corpus.SITEMAPS[0], corpus.COMMUNITY + "/Orion", corpus.COMMUNITY + "/Retired"]
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT count(*) FROM note_revisions").fetchone() == (1,)
+
+
+@pytest.mark.parametrize("selected", ["community", ["unknown"], [None], 1])
+def test_invalid_catalog_selection_refuses_before_database_or_network(tmp_path, selected):
+    path = tmp_path / "not-created.sqlite3"
+    source = Publisher()
+    with pytest.raises(ValueError):
+        refresh.refresh_once(path, publisher=source, enabled_catalogs=selected)
+    assert not path.exists() and source.calls == []
+
+
+def test_missing_child_sitemap_keeps_previous_catalog(tmp_path):
+    db = tmp_path / "wiki.sqlite3"
+    source = ChangingCatalogPublisher()
+    refresh.refresh_once(db, publisher=source, clock=lambda: 1000)
+    normal_get = source.get
+    def incomplete(url, limit=0):
+        if url == corpus.SITEMAPS[0]:
+            return ('<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+                    '<sitemap><loc>https://sitemap.starcitizen.tools/valid.xml</loc></sitemap>'
+                    '<sitemap/></sitemapindex>')
+        if url.endswith("valid.xml"):
+            return ('<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+                    '<url><loc>https://starcitizen.tools/Orion</loc></url></urlset>')
+        return normal_get(url, limit)
+    source.get = incomplete
+    report = refresh.refresh_once(db, publisher=source, clock=lambda: 90_000)
+    assert report.catalogs["community"]["state"] == "failed"
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT count(*) FROM wiki_urls WHERE status='removed'").fetchone() == (0,)
+
+
+def test_changing_galactapedia_total_cannot_commit_mixed_pagination(tmp_path):
+    source = corpus.Publisher()
+    source.allowed = lambda url: True
+    def page(total, ident, more):
+        return json.dumps({"data": {"allArticle": {"totalCount": total,
+            "edges": [{"node": {"id": ident, "title": "Ship", "slug": "ship"}}],
+            "pageInfo": {"hasNextPage": more, "endCursor": "next" if more else None}}}})
+    with patch.object(source, "_get", side_effect=[page(2, "ABC123def0", True), page(1, "XYZ123abc0", False)]):
+        with pytest.raises(ValueError, match="changed during pagination"):
+            refresh._catalog(source, "galactapedia", None)
+
+
+def test_removed_page_cannot_resurrect_another_pages_reused_id(tmp_path):
+    db = tmp_path / "wiki.sqlite3"
+    source = ChangingCatalogPublisher()
+    target = corpus.COMMUNITY + "/Retired"
+    refresh.refresh_once(db, publisher=source, clock=lambda: 1000, page_interval=60)
+    normal_get = source.get
+    def missing(url, limit=0):
+        if url == target:
+            raise HTTPError(url, 410, "Gone", {}, io.BytesIO())
+        return normal_get(url, limit)
+    source.get = missing
+    refresh.refresh_once(db, publisher=source, clock=lambda: 1061, page_interval=60)
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT status,pageid FROM wiki_urls WHERE url=?", (target,)).fetchone() == ("removed", None)
+        assert conn.execute("SELECT reason FROM source_changes WHERE url=?", (target,)).fetchone() == ("page_removed",)
+        # A newly indexed page may reuse the deleted highest SQLite row ID.
+        corpus.crawl(conn, source, 1, [corpus.COMMUNITY + "/New"])
+    source.get = normal_get
+    refresh.refresh_once(db, publisher=source, clock=lambda: 90_000, page_interval=60)
+    with sqlite3.connect(db) as conn:
+        pageid = conn.execute("SELECT pageid FROM wiki_urls WHERE url=?", (target,)).fetchone()[0]
+        assert conn.execute("SELECT url FROM page_sources WHERE pageid=?", (pageid,)).fetchone() == (target,)
