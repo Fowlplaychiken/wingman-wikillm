@@ -75,6 +75,16 @@ def test_root_and_article_scope_matches_home_page_and_excludes_native_sources():
         assert not web.in_scope(value if value.startswith('http') else 'https://wiki.example'+value, A)
 
 
+def test_nested_history_article_is_allowed_but_mounted_admin_route_is_rejected():
+    root = 'https://wiki.example/game/wiki/Main_Page'
+    history = 'https://wiki.example/game/wiki/History'
+    assert web.in_scope(history, root)
+    assert web._article(root, '/game/wiki/History') == history
+    with pytest.raises(ValueError, match='admin endpoints'):
+        web.parse_roots('https://wiki.example/game/wiki/admin/settings')
+    assert not web.in_scope('https://wiki.example/game/wiki/admin/settings', root)
+
+
 def test_nested_frontier_full_text_natural_search_and_two_game_isolation(tmp_path):
     source, db = Fixture(), tmp_path / 'wiki.sqlite3'
     source.pages[A] = html('Game A', links=['/game-a/Depth1', B, 'https://other.example/Page', '/game-a/File:Photo.png'])
