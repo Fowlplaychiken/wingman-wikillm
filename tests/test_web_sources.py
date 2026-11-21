@@ -98,6 +98,35 @@ def test_nested_frontier_full_text_natural_search_and_two_game_isolation(tmp_pat
     assert web.web_coverage(db, (A,))[A]['pages']['indexed'] == 7
 
 
+def test_complete_broad_and_deep_edition_matches_independent_inventory(tmp_path):
+    source, db = Fixture(), tmp_path / "library.sqlite3"
+    root = "https://wiki.example/game-a/"
+    sections, levels = range(12), range(1, 13)
+    urls = [root + f"Section_{section}/Level_{level}" for section in sections for level in levels]
+    orphan = root + "Appendix/Errata"
+    manifest = tmp_path / "publisher.jsonl"
+    manifest.write_text("".join(json.dumps({"url": url}) + "\n" for url in [A, *urls, orphan]))
+    source.pages[A] = html("Home", links=[root + f"Section_{section}/Level_1" for section in sections])
+    for section in sections:
+        for level in levels:
+            url = root + f"Section_{section}/Level_{level}"
+            links = [A] if level == 12 else [root + f"Section_{section}/Level_{level+1}"]
+            source.pages[url] = html(f"Section {section} level {level}", links=links)
+    source.pages[orphan] = html("Errata")
+    options = dict(roots=(A,), include_star_citizen=False)
+    for _ in range(20):
+        report = source.run(db, batch_size=17)
+        if not report["indexed"]:
+            break
+    audit = check_inventory(db, manifest, **options)
+    assert (audit["present"], audit["missing_text"]) == (145, 1)
+    assert check_inventory(db, manifest, queue_missing=True, **options)["new_urls_queued"] == 1
+    assert source.run(db, batch_size=1)["indexed"] == 1
+    audit = check_inventory(db, manifest, **options)
+    assert (audit["present"], audit["missing_text"]) == (146, 0)
+    assert all(web.read_web_page(db, url, (A,))["passages"] for url in [A, *urls, orphan])
+
+
 def test_no_license_only_one_short_excerpt_and_denied_signals_store_nothing(tmp_path):
     source, db = Fixture(), tmp_path / 'wiki.sqlite3'
     source.pages[A] = html('Unlicensed', ' '.join('word'+str(i) for i in range(80)), license=None)

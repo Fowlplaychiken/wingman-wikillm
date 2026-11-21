@@ -157,7 +157,7 @@ def _normalize_feed(raw: object) -> JsonFeed:
         raw = {"url": raw}
     if not isinstance(raw, dict) or set(raw) - _FIELDS:
         raise ValueError("Each JSON feed must be a URL or a JSON object with supported mapping fields")
-    url = _feed_url(raw.get("url"))
+    url = _feed_url(web_sources.pasted_address(raw.get("url")))
     values = {}
     for key in ("items", "title", "text", "url_field", "next", "total", "url_template", "id_field"):
         default = getattr(JsonFeed(url), key)

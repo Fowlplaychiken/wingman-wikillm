@@ -109,6 +109,13 @@ def _url(value):
     return urlunsplit(("https", host, quote(path, safe="/:@-._~!$&'()*+,;=%"), query, ""))
 
 
+def pasted_address(value):
+    """Allow a bare public hostname in settings while keeping network validation unchanged."""
+    if isinstance(value, str) and re.match(r"^[\w-]+(?:\.[\w-]+)+(?=[/?#]|$)", value):
+        return "https://" + value
+    return value
+
+
 def parse_roots(text) -> tuple[str, ...]:
     """One public wiki per line. Prefix a line with # to pause it."""
     if not isinstance(text, str):
@@ -117,7 +124,7 @@ def parse_roots(text) -> tuple[str, ...]:
     for line in text.splitlines():
         if not line.strip() or line.lstrip().startswith("#"):
             continue
-        url = _url(line.strip())
+        url = _url(pasted_address(line.strip()))
         if (_ADMIN.search(unquote(urlsplit(url).path)) or _ASSET.search(urlsplit(url).path)
                 or _BLOCKED_NAMESPACE.search(unquote(urlsplit(url).path))):
             raise ValueError("Choose a wiki base or article page")
@@ -327,6 +334,8 @@ def _enumerate_api(db, contact, root, rules):
         if target:
             targets.append(target)
     following = _api_continuation(data.get("continue"))
+    if len(targets) < len(pages) and reason is None:
+        reason = "listed_titles_outside_crawl_scope"
     current_key = _page_key(namespace, continuation)
     if following and (following == continuation or db.execute(
             "SELECT 1 FROM web_api_cursors WHERE root=? AND cursor=?", (root, _page_key(namespace, following))).fetchone()):
@@ -342,7 +351,8 @@ def _enumerate_api(db, contact, root, rules):
             (next_cursor, 0 if next_cursor else contact.clock()+86_400, contact.clock(), reason, root))
         if next_cursor is None:
             db.execute("DELETE FROM web_api_cursors WHERE root=?", (root,))
-    return {"state": "advanced", "namespace": namespace, "discovered": len(targets),
+    return {"state": "advanced", "namespace": namespace, "discovered": len(targets), "listed": len(pages),
+            "more_pages": next_cursor is not None,
             "complete": next_cursor is None and reason is None, "reason": reason}
 
 

@@ -9,6 +9,7 @@ from .dependencies.wingman_wiki.json_feeds import parse_feeds
 from .dependencies.wingman_wiki.reference import community_db_path
 from .dependencies.wingman_wiki.refresh import refresh_once, snapshot_limits
 from .dependencies.wingman_wiki.snapshots import import_snapshot
+from .dependencies.wingman_wiki.source_choices import effective_sources
 from .dependencies.wingman_wiki.web_sources import parse_roots
 
 
@@ -45,6 +46,7 @@ def main():
     try:
         roots = parse_roots("\n".join(args.wiki))
         feeds = parse_feeds("\n".join(args.api))
+        roots, feeds = effective_sources(db, roots, feeds)
         options = {"include_star_citizen": not args.no_sc, "roots": roots, "feeds": feeds}
         if args.command == "lookup":
             result = lookup(Path(__file__).with_name("guides"), args.query, args.build, db, **options)

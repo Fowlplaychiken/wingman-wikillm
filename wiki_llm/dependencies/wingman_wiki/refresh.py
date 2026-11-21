@@ -68,6 +68,8 @@ class RefreshReport:
         if self.indexed and community.get("catalog_urls", 0) > community.get("indexed_pages", 0):
             return True
         wikis = self.sources.get("wikis", {})
+        if any(root.get("api", {}).get("more_pages") for root in wikis.get("roots", {}).values()):
+            return True
         return bool(wikis.get("indexed") and any(
             source.get("pages", {}).get("pending") for source in wikis.get("coverage", {}).values()))
 
@@ -381,15 +383,17 @@ class RefreshScheduler:
     stop() interrupts pacing immediately. An active HTTP request may take its
     existing 15 second timeout; False means the worker has not stopped yet.
     """
-    def __init__(self, db_path, *, interval=3600, catch_up=False, **refresh_options):
+    def __init__(self, db_path, *, interval=3600, catch_up=False, source_provider=None, **refresh_options):
         if type(interval) not in (int, float) or not 60 <= interval <= 31_536_000:
             raise ValueError("scheduler interval must be 60 seconds..1 year")
         if "stop_event" in refresh_options:
             raise ValueError("scheduler owns its cancellation event")
-        if refresh_options.get("feeds"):
+        if source_provider or refresh_options.get("feeds"):
             refresh_options.setdefault("feed_interval", interval)
         self.db_path, self.interval, self.options = db_path, interval, refresh_options
         self.catch_up = catch_up
+        self.source_provider = source_provider
+        self._wake = threading.Event()
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._thread = None
@@ -408,12 +412,15 @@ class RefreshScheduler:
     def _work(self):
         next_import = 0.0
         while not self._stop.is_set():
+            self._wake.clear()
             delay = self.interval
             try:
                 options = self.options.copy()
+                if self.source_provider:
+                    options["roots"], options["feeds"] = self.source_provider()
                 if options.get("import_snapshots"):
                     options["import_snapshots"] = time.monotonic() >= next_import
-                self.last_report = refresh_once(self.db_path, stop_event=self._stop, **options)
+                self.last_report = refresh_once(self.db_path, stop_event=_Cancellation(self._stop, self._wake), **options)
                 if "imports" in self.last_report.sources:
                     next_import = time.monotonic() + self.interval
                 if self.catch_up and self.last_report.building_library():
@@ -421,12 +428,16 @@ class RefreshScheduler:
                 self.last_error = None
             except Exception as exc:
                 self.last_error = type(exc).__name__
-            if self._stop.wait(delay):
-                break
+            if not self._stop.is_set():
+                self._wake.wait(delay)
+
+    def sources_changed(self):
+        self._wake.set()
 
     def stop(self, timeout=0):
         with self._lock:
             self._stop.set()
+            self._wake.set()
             thread = self._thread
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout)

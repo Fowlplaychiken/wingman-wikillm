@@ -17,10 +17,8 @@ class DistributionPrivacyTests(unittest.TestCase):
             root = Path(tmp)
             package = root / "wiki_llm"
             shutil.copytree(build.PACKAGE, package)
-            for name in ("README.md", "LICENSE"):
-                shutil.copyfile(build.ROOT / name, root / name)
             (root / "docs").mkdir()
-            for name in build.BINARY_FILES:
+            for name in (*build.DOCUMENTS, *build.BINARY_FILES):
                 shutil.copyfile(build.ROOT / name, root / name)
             marker = "PRIVATE-OBSERVATION-573A"
             (root / "docs" / "private.webp").write_bytes(marker.encode())
@@ -38,7 +36,7 @@ class DistributionPrivacyTests(unittest.TestCase):
             with zipfile.ZipFile(archive) as bundle:
                 self.assertEqual(set(bundle.namelist()), {
                     "wiki_llm/" + name.replace("dependencies/wingman_wiki/", f"dependencies/{namespace}/")
-                    for name in (*build.FILES, *build.BINARY_FILES, "LICENSE", "README.md")})
+                    for name in (*build.FILES, *build.BINARY_FILES, *build.DOCUMENTS)})
                 self.assertFalse(any(marker.encode() in bundle.read(k) for k in bundle.namelist()))
 
     def test_binary_banner_is_exact_and_readme_relative(self):
