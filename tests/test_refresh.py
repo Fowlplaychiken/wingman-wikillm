@@ -105,6 +105,48 @@ def test_changed_page_failure_preserves_searchable_excerpt_and_recovers(tmp_path
         assert connection.execute("SELECT last_error FROM refresh_pages WHERE url=?", (corpus.COMMUNITY + "/Alpha",)).fetchone()[0] is None
 
 
+def test_body_vocabulary_is_discovery_only_and_replaced_on_refresh(tmp_path):
+    from wiki_llm.dependencies.wingman_wiki.library import lookup
+    from wiki_llm.dependencies.wingman_wiki.reference import WikiReference
+    db = tmp_path / "wiki.sqlite3"
+    source = Publisher()
+    original_get = source.get
+    body = ["Calibrated xenon baffle supports the aft radiator."]
+
+    def page(url, limit=0):
+        if url in corpus.SITEMAPS:
+            return original_get(url, limit)
+        return ('<meta property="og:title" content="Alpha">'
+                '<article><p>' + source.text + '</p><p>' + body[0] +
+                '</p><aside>hidden obelisk term</aside><script>privatequasar term</script></article>')
+
+    source.get = page
+    refresh.refresh_once(db, publisher=source, clock=lambda: 1000, page_interval=60)
+    result = lookup(Path(__file__).resolve().parents[1] / "wiki_llm" / "guides",
+                    "xenon baffle", db_path=db)
+    assert result["references"] == []
+    assert result["discovery_links"][0]["title"] == "Alpha"
+    assert result["discovery_links"][0]["citation"] == corpus.COMMUNITY + "/Alpha"
+    assert result["discovery_links"][0]["matched_on"] == "body_vocabulary"
+    assert result["discovery_links"][0]["insufficient_evidence"] is True
+    assert "excerpt" not in result["discovery_links"][0]
+    with sqlite3.connect(db) as connection:
+        terms, = connection.execute("SELECT terms FROM page_vocabulary").fetchone()
+        assert "xenon" in terms and "baffle" in terms
+        assert "hidden" not in terms and "privatequasar" not in terms
+        assert len(terms.split()) == len(set(terms.split()))
+        assert "Calibrated" not in terms
+
+    body[0] = "Encrypted iridium valve regulates coolant flow."
+    refresh.refresh_once(db, publisher=source, clock=lambda: 1061, page_interval=60)
+    assert WikiReference.search_catalog("xenon baffle", db) == []
+    changed = WikiReference.search_catalog("iridium valve", db)
+    assert changed and changed[0]["matched_on"] == "body_vocabulary"
+    with sqlite3.connect(db) as connection:
+        assert connection.execute("SELECT reason FROM source_changes WHERE url=?",
+                                  (corpus.COMMUNITY + "/Alpha",)).fetchone() == ("page_vocabulary_changed",)
+
+
 def test_shared_database_lease_and_expired_recovery(tmp_path):
     db = tmp_path / "wiki.sqlite3"
     entered, release = threading.Event(), threading.Event()
@@ -601,6 +643,7 @@ def test_removed_page_cannot_resurrect_another_pages_reused_id(tmp_path):
     with sqlite3.connect(db) as conn:
         assert conn.execute("SELECT status,pageid FROM wiki_urls WHERE url=?", (target,)).fetchone() == ("removed", None)
         assert conn.execute("SELECT reason FROM source_changes WHERE url=?", (target,)).fetchone() == ("page_removed",)
+        assert conn.execute("SELECT count(*) FROM page_vocabulary").fetchone() == (1,)
         # A newly indexed page may reuse the deleted highest SQLite row ID.
         corpus.crawl(conn, source, 1, [corpus.COMMUNITY + "/New"])
     source.get = normal_get

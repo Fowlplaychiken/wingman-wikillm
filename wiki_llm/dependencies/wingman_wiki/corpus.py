@@ -45,6 +45,9 @@ CREATE VIRTUAL TABLE IF NOT EXISTS page_search USING fts5(title, extract,
     content='pages', content_rowid='pageid', tokenize='porter unicode61');
 CREATE VIRTUAL TABLE IF NOT EXISTS catalog_search USING fts5(url UNINDEXED, title,
     publisher UNINDEXED, tokenize='porter unicode61');
+-- Retain only a page's deduplicated vocabulary, never its full source prose.
+CREATE VIRTUAL TABLE IF NOT EXISTS page_vocabulary USING fts5(
+    terms, tokenize='porter unicode61');
 CREATE TRIGGER IF NOT EXISTS fts_insert AFTER INSERT ON pages BEGIN
     INSERT INTO page_search(rowid, title, extract) VALUES (new.pageid, new.title, new.extract);
 END;
@@ -364,12 +367,13 @@ def sitemap_entries(source: Publisher, url: str, seen: set[str]):
 
 
 class Article(HTMLParser):
-    """Extract page identity and a short excerpt from the first article paragraph."""
+    """Extract page identity, one short excerpt, and body vocabulary."""
 
     def __init__(self, body: str) -> None:
         super().__init__()
         self.stack: list[tuple[str, bool, bool, bool]] = []
         self.paragraph: list[str] = []
+        self.vocabulary: set[str] = set()
         self.excerpt = ""
         self.title = ""
         self.revision = re.search(r'"wgRevisionId"\s*:\s*(\d+)', body)
@@ -418,6 +422,8 @@ class Article(HTMLParser):
         del self.stack[i:]
 
     def handle_data(self, data):
+        if self.stack and self.stack[-1][1] and not self.stack[-1][2]:
+            self.vocabulary.update(re.findall(r"[a-zA-Z][a-zA-Z0-9-]{1,}|[0-9]+(?:\.[0-9]+){1,3}", data.casefold()))
         if not self.excerpt and self.stack and self.stack[-1][1:] == (True, False, True):
             self.paragraph.append(data)
 
@@ -624,6 +630,7 @@ def crawl(
                     "DELETE FROM pages WHERE pageid=(SELECT pageid FROM page_sources WHERE url=?)",
                     (url,),
                 )
+                db.execute("DELETE FROM page_vocabulary WHERE rowid=(SELECT pageid FROM page_sources WHERE url=?)", (url,))
                 db.execute("DELETE FROM page_sources WHERE url=?", (url,))
                 db.execute(
                     "UPDATE wiki_urls SET status='removed',checked_at=?,pageid=NULL WHERE url=?", (checked, url)
@@ -636,19 +643,24 @@ def crawl(
         revision = int(article.revision.group(1)) if article.revision else None
         title = article.title or wiki_title(url)
         origin = publisher_name(url)
+        terms = " ".join(sorted(article.vocabulary))
         with db:
-            row = db.execute("""SELECT p.pageid,p.title,p.revision,p.timestamp,p.extract
-                FROM page_sources s JOIN pages p ON p.pageid=s.pageid WHERE s.url=?""", (url,)).fetchone()
+            row = db.execute("""SELECT p.pageid,p.title,p.revision,p.timestamp,p.extract,v.terms
+                FROM page_sources s JOIN pages p ON p.pageid=s.pageid
+                LEFT JOIN page_vocabulary v ON v.rowid=p.pageid WHERE s.url=?""", (url,)).fetchone()
             if row:
                 pageid = row[0]
                 # Even an unchanged title/sitemap can contain a new MediaWiki
                 # revision. Record the observed signal without editing notes.
-                reason = next((label for before, after, label in (
+                observed = [
                     (row[2], revision, "page_revision_changed"),
                     (row[1], title, "page_title_changed"),
                     (row[3], stamp, "page_metadata_changed"),
                     (row[4], article.excerpt, "page_excerpt_changed"),
-                ) if before != after), None)
+                ]
+                if row[5] is not None:
+                    observed.append((row[5], terms, "page_vocabulary_changed"))
+                reason = next((label for before, after, label in observed if before != after), None)
                 if reason:
                     record_source_change(db, url, checked, reason)
                 db.execute(
@@ -666,6 +678,9 @@ def crawl(
                 db.execute(
                     "INSERT INTO page_sources VALUES(?,?,?,?)", (pageid, url, origin, checked)
                 )
+            db.execute("DELETE FROM page_vocabulary WHERE rowid=?", (pageid,))
+            if terms:
+                db.execute("INSERT INTO page_vocabulary(rowid,terms) VALUES(?,?)", (pageid, terms))
             db.execute(
                 """INSERT INTO wiki_urls(url,pageid,checked_at,status) VALUES(?,?,?,'indexed')
                 ON CONFLICT(url) DO UPDATE SET pageid=excluded.pageid,
