@@ -277,7 +277,7 @@ def refresh_once(db_path: str | Path, *, batch_size: int = 5,
                  catalog_interval: float = 86_400, page_interval: float = 604_800,
                  publisher=None, stop_event: threading.Event | None = None,
                  clock=time.time, enabled_catalogs=None, roots=(), import_snapshots=False,
-                 include_sc_edition=False) -> RefreshReport:
+                 include_sc_edition=False, sync_galactapedia=False) -> RefreshReport:
     """One leased refresh for a per-user DB; stale lease recovers after 120 s.
 
     A small heartbeat renews during bounded network reads. Losing the lease
@@ -289,7 +289,7 @@ def refresh_once(db_path: str | Path, *, batch_size: int = 5,
     path = Path(db_path).expanduser()
     from .snapshots import bundled_edition, sync_snapshots
     edition = bundled_edition() if include_sc_edition and import_snapshots else None
-    if not enabled and not roots and import_snapshots and edition is None and not (path.parent / "snapshots").exists():
+    if not enabled and not roots and not sync_galactapedia and import_snapshots and edition is None and not (path.parent / "snapshots").exists():
         return RefreshReport()
     path.parent.mkdir(parents=True, exist_ok=True)
     token = uuid.uuid4().hex
@@ -327,6 +327,17 @@ def refresh_once(db_path: str | Path, *, batch_size: int = 5,
             report = _refresh_once(path, batch_size=batch_size, catalog_interval=catalog_interval,
                 page_interval=page_interval, publisher=publisher, stop_event=cancellation, clock=clock,
                 enabled_catalogs=enabled)
+        if sync_galactapedia and not cancellation.is_set():
+            from .galactapedia_feed import refresh_galactapedia
+            try:
+                feed = refresh_galactapedia(path, stop_event=cancellation, clock=clock)
+                report.sources["galactapedia"] = feed
+                report.failed += int(feed.get("status") in {"failed", "error"})
+            except corpus.RefreshCancelled:
+                report.cancelled = True
+            except Exception as exc:
+                report.sources["galactapedia"] = {"status": "failed", "error_type": type(exc).__name__}
+                report.failed += 1
         if roots and not cancellation.is_set():
             from .web_sources import refresh_web_sources
             try:

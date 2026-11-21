@@ -35,7 +35,8 @@ CREATE TABLE IF NOT EXISTS web_hosts(host TEXT PRIMARY KEY,last_request REAL NOT
 CREATE TABLE IF NOT EXISTS web_pages(root TEXT NOT NULL,url TEXT NOT NULL,title TEXT,
  status TEXT NOT NULL DEFAULT 'pending',license TEXT,storage_mode TEXT,
  retrieved_at TEXT,etag TEXT,last_modified TEXT,content_sha256 TEXT,
- next_attempt REAL NOT NULL DEFAULT 0,last_error TEXT,redirect_url TEXT,PRIMARY KEY(root,url));
+ next_attempt REAL NOT NULL DEFAULT 0,last_error TEXT,redirect_url TEXT,
+ links_scanned INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(root,url));
 CREATE INDEX IF NOT EXISTS web_pages_due ON web_pages(root,next_attempt,url);
 CREATE VIRTUAL TABLE IF NOT EXISTS web_passages USING fts5(
  root UNINDEXED,url UNINDEXED,ordinal UNINDEXED,title,text,tokenize='porter unicode61');
@@ -459,6 +460,10 @@ class _Contact:
             raise ValueError("Public wiki robots unavailable")
         with self.db:
             self.db.execute("UPDATE web_hosts SET robots=?,robots_checked=? WHERE host=?", (rules, self.clock(), host))
+            if row and row[0] and _reference_only(row[0]) and not _reference_only(rules):
+                self.db.execute("""UPDATE web_pages SET etag=NULL,last_modified=NULL,next_attempt=0
+                    WHERE instr(url,?)=1 AND status='indexed' AND storage_mode='short_excerpt' AND license IS NOT NULL""",
+                    ("https://" + host + "/",))
         return rules
 
     def follow(self, url, *, rules="", headers=None):
@@ -488,6 +493,11 @@ def _allowed(rules, url):
     return corpus.allowed_by_robots(rules, path) and not denied_input
 
 
+def _reference_only(rules):
+    return any(key == "content-signal" and re.search(r"(?:^|,)\s*use\s*=\s*reference\s*(?:,|$)", value, re.I)
+               for group in corpus.robots_groups(rules) for key, value in group)
+
+
 class _Page(HTMLParser):
     def __init__(self, body):
         super().__init__(convert_charrefs=True)
@@ -495,6 +505,7 @@ class _Page(HTMLParser):
         self.blocks, self.current, self.links = [], [], []
         self._regions = {i: [] for i in range(5)}
         self._prose_regions = {i: [] for i in range(5)}
+        self._text_regions = set()
         self._paragraph, self._paragraph_region = [], 0
         self._current_region = 0
         self.title, self.canonical, self.license, self.denied = "", None, None, False
@@ -510,6 +521,7 @@ class _Page(HTMLParser):
         region = max((i for i, blocks in self._regions.items() if blocks), default=0)
         self.blocks = self._regions[region]
         self.prose = self._prose_regions[region]
+        self.has_article_text = region in self._text_regions
 
     def _flush(self):
         text = " ".join("".join(self.current).split())
@@ -610,12 +622,34 @@ class _Page(HTMLParser):
                     self._flush()
                     self._current_region = region
                 self.current.append(data + " ")
+                if data.strip() and any(ch.isalnum() for ch in data):
+                    tags = {item[0] for item in self.stack}
+                    if "a" not in tags and tags.intersection({"p", "td", "dd", "pre"}):
+                        self._text_regions.add(region)
                 if any(item[0] == "p" for item in self.stack):
                     self._paragraph.append(data + " ")
 
 
 def _queue(db, root, url):
-    db.execute("INSERT OR IGNORE INTO web_pages(root,url) VALUES(?,?)", (root, url))
+    return db.execute("INSERT OR IGNORE INTO web_pages(root,url) VALUES(?,?)", (root, url)).rowcount
+
+
+def queue_inventory_urls(db_path, roots, urls):
+    """Queue missing publisher inventory URLs within enabled custom wiki scopes."""
+    roots = sorted(_roots(roots), key=lambda root: len(_scope(root)), reverse=True)
+    if not roots:
+        return 0
+    path = Path(db_path).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    added = 0
+    with closing(sqlite3.connect(path, timeout=2)) as db, db:
+        db.executescript(SCHEMA)
+        for url in urls:
+            for root in roots:
+                if in_scope(url, root):
+                    added += _queue(db, root, _url(url))
+                    break
+    return added
 
 
 def _conditional(etag, modified):
@@ -744,9 +778,16 @@ def refresh_web_sources(db_path, roots, *, batch_size=5, stop_event=None,
         if "discovery_retry" not in {r[1] for r in db.execute("PRAGMA table_info(web_roots)")}:
             db.execute("ALTER TABLE web_roots ADD COLUMN discovery_retry REAL NOT NULL DEFAULT 0")
             db.commit()
-        if "redirect_url" not in {r[1] for r in db.execute("PRAGMA table_info(web_pages)")}:
+        page_columns = {r[1] for r in db.execute("PRAGMA table_info(web_pages)")}
+        if "redirect_url" not in page_columns:
             db.execute("ALTER TABLE web_pages ADD COLUMN redirect_url TEXT")
             db.commit()
+        if "links_scanned" not in page_columns:
+            with db:
+                db.execute("ALTER TABLE web_pages ADD COLUMN links_scanned INTEGER NOT NULL DEFAULT 0")
+                # Older versions retained the article text but discarded navigation.
+                # Revisit the home page first. Other pages use the normal paced queue.
+                db.execute("UPDATE web_pages SET next_attempt=0 WHERE root=url AND status='indexed' AND last_error IS NULL")
         contact = _Contact(db, _transport or globals()["_transport"], _clock, stop_event)
         last = db.execute("SELECT last_root FROM web_cursor WHERE id=1").fetchone()
         start = (roots.index(last[0])+1) % len(roots) if last and last[0] in roots else 0
@@ -762,9 +803,14 @@ def refresh_web_sources(db_path, roots, *, batch_size=5, stop_event=None,
                 rules = contact.robots(root)
                 observed = datetime.fromtimestamp(_clock(), UTC).isoformat(timespec="microseconds")
                 with db:
-                    for (url,) in db.execute("SELECT url FROM web_pages WHERE root=? AND status='indexed'", (root,)).fetchall():
+                    reference_only = _reference_only(rules)
+                    for url, mode in db.execute("SELECT url,storage_mode FROM web_pages WHERE root=? AND status='indexed'", (root,)).fetchall():
                         if not _allowed(rules, url):
                             _purge(db, root, url, "blocked", observed)
+                        elif reference_only and mode == "full_text":
+                            _purge(db, root, url, "pending")
+                            db.execute("UPDATE web_pages SET next_attempt=0 WHERE root=? AND url=?", (root, url))
+                            corpus.record_source_change(db, url, observed, "web_storage_changed")
                 if not _allowed(rules, root):
                     with db:
                         for (url,) in db.execute("SELECT url FROM web_pages WHERE root=?", (root,)).fetchall():
@@ -823,9 +869,9 @@ def refresh_web_sources(db_path, roots, *, batch_size=5, stop_event=None,
                 prefer = db.execute("SELECT prefer_existing FROM web_roots WHERE root=?", (root,)).fetchone()[0]
                 row = None
                 for group in (prefer, 1-prefer):
-                    row = db.execute("""SELECT url,etag,last_modified,content_sha256,status,redirect_url FROM web_pages
+                    row = db.execute("""SELECT url,etag,last_modified,content_sha256,status,redirect_url,links_scanned FROM web_pages
                         WHERE root=? AND (retrieved_at IS NOT NULL)=? AND next_attempt<=?
-                        AND NOT (status='indexed' AND next_attempt>0 AND next_attempt>?
+                        AND NOT (status='indexed' AND links_scanned=1 AND next_attempt>0 AND next_attempt>?
                             AND last_error IS NULL AND EXISTS (
                             SELECT 1 FROM web_sitemap_entries e JOIN web_sitemaps s
                               ON s.root=e.root AND s.url=e.sitemap
@@ -839,7 +885,7 @@ def refresh_web_sources(db_path, roots, *, batch_size=5, stop_event=None,
                         break
                 if not row:
                     continue
-                url, etag, modified, old_hash, old_status, old_redirect = row
+                url, etag, modified, old_hash, old_status, old_redirect, links_scanned = row
                 now = _clock()
                 observed = datetime.fromtimestamp(now, UTC).isoformat(timespec="microseconds")
                 with db:
@@ -855,7 +901,7 @@ def refresh_web_sources(db_path, roots, *, batch_size=5, stop_event=None,
                         with db:
                             _purge(db, root, url, "blocked", observed)
                         raise _Denied("robots_disallowed")
-                    conditional = _conditional(etag, modified) if old_status == "indexed" else {}
+                    conditional = _conditional(etag, modified) if old_status == "indexed" and links_scanned else {}
                     response = contact.get(url, rules=rules, headers=conditional)
                     header_signals = response.headers.get("x-robots-tag", "")
                     if re.search(r"\b(?:noindex|none|noai|nosnippet)\b|max-snippet\s*:\s*0\b", header_signals, re.I):
@@ -917,10 +963,11 @@ def refresh_web_sources(db_path, roots, *, batch_size=5, stop_event=None,
                             target = _article(root, urljoin(url, link))
                             if target:
                                 _queue(db, root, target)
-                    if not page.blocks or sum(map(len, page.blocks)) < 42:
+                    if not page.blocks or (not page.has_article_text and sum(map(len, page.blocks)) < 42):
                         raise ValueError("Public wiki page has no usable article text")
                     title = page.title or corpus.wiki_title(url)
-                    full_text = page.license and not page.no_full_text and not re.search(r"\bnoarchive\b", signals, re.I)
+                    full_text = (page.license and not page.no_full_text and not _reference_only(rules)
+                                 and not re.search(r"\bnoarchive\b", signals, re.I))
                     mode = "full_text" if full_text else "short_excerpt"
                     passages = ([block[start:start+1600] for block in page.blocks for start in range(0, len(block), 1600)]
                                 if full_text else [page.short_excerpt()])
@@ -933,7 +980,7 @@ def refresh_web_sources(db_path, roots, *, batch_size=5, stop_event=None,
                             db.executemany("INSERT INTO web_passages(root,url,ordinal,title,text) VALUES(?,?,?,?,?)",
                                 [(root, url, i, title, text) for i, text in enumerate(passages)])
                         db.execute("""UPDATE web_pages SET title=?,status='indexed',license=?,storage_mode=?,
-                            retrieved_at=?,etag=?,last_modified=?,content_sha256=?,next_attempt=?,last_error=NULL,redirect_url=NULL
+                            retrieved_at=?,etag=?,last_modified=?,content_sha256=?,next_attempt=?,last_error=NULL,redirect_url=NULL,links_scanned=1
                             WHERE root=? AND url=?""", (title, page.license, mode, observed,
                             response.headers.get("etag"), response.headers.get("last-modified"), content_hash, now+604_800, root, url))
                         db.execute("UPDATE web_roots SET last_success=? WHERE root=?", (now, root))

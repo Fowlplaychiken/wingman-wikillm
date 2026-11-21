@@ -555,7 +555,7 @@ def _file_format(path: Path) -> tuple[str, str | None]:
 def import_snapshot(db_path: Path | str, path: Path | str, *,
                     max_compressed_bytes: int | None = DEFAULT_MAX_COMPRESSED_BYTES,
                     max_expanded_bytes: int | None = DEFAULT_MAX_EXPANDED_BYTES,
-                    max_pages: int | None = DEFAULT_MAX_PAGES) -> dict:
+                    max_pages: int | None = DEFAULT_MAX_PAGES, on_publish=None) -> dict:
     """Import one local XML/JSONL snapshot transactionally.
 
     The source identity is tied to its resolved file path. Reimporting a changed
@@ -582,11 +582,18 @@ def import_snapshot(db_path: Path | str, path: Path | str, *,
     db_path.parent.mkdir(parents=True, exist_ok=True)
     with closing(sqlite3.connect(db_path, timeout=10)) as db:
         _ensure_schema(db)
+        if on_publish is not None:
+            db.execute("BEGIN IMMEDIATE")
         existing = db.execute("SELECT content_sha256,page_count FROM snapshot_sources WHERE source_id=?",
                               (source_id,)).fetchone()
         if existing and existing[0] == digest:
+            if on_publish is not None:
+                with db:
+                    on_publish(db, source_id)
             return {"status": "unchanged", "source_id": source_id,
                     "file_format": file_format, "page_count": existing[1]}
+        if on_publish is not None:
+            db.commit()  # Release the writer lock while the input file is staged.
         db.execute("""CREATE TEMP TABLE snapshot_stage (
             page_key TEXT PRIMARY KEY,url TEXT NOT NULL,source_origin TEXT NOT NULL,
             title TEXT NOT NULL,body TEXT NOT NULL,revision TEXT,revision_timestamp TEXT,
@@ -693,6 +700,8 @@ def import_snapshot(db_path: Path | str, path: Path | str, *,
                 page_count=excluded.page_count,imported_at=excluded.imported_at""",
                        (source_id, source_path.name, file_format, source_origin, digest,
                         original_stat.st_size, page_count, imported_at))
+            if on_publish is not None:
+                on_publish(db, source_id)
             db.commit()
         except (OSError, EOFError, zlib.error) as error:
             if db.in_transaction:
@@ -751,8 +760,16 @@ def sync_snapshots(db_path: Path | str, *, packaged_edition: Path | None = None,
     return {"status": "synced", "directory": str(directory), "sources": results}
 
 
-def _snapshot_provenance(row: sqlite3.Row) -> dict:
+def _snapshot_provenance(row: sqlite3.Row, db: sqlite3.Connection) -> dict:
     source = {"source_kind": "user_supplied_snapshot", "citation": row["url"], "live_state": False}
+    if row["file_format"] == "galactapedia-community-api":
+        source.update(source_kind="galactapedia_article", publisher="Cloud Imperium Games",
+                      via="Star Citizen Wiki API", attribution_url="https://api.star-citizen.wiki/developers")
+        gap = db.execute("""SELECT reason,discovered_at FROM galactapedia_feed_gaps
+            WHERE url=? AND retained_prior_body=1""", (row["url"],)).fetchone()
+        if gap:
+            source.update(needs_review=True, edition_state="previous_saved_text",
+                          current_feed_gap=gap["reason"], gap_observed_at=gap["discovered_at"])
     if row["file_format"] == "starcitizen-archive-20230930":
         history = urlencode({"title": row["title"].replace(" ", "_"), "action": "history"})
         source.update({
@@ -805,11 +822,12 @@ def search_snapshots(query: object, db_path: Path | str, limit: int = 3, *,
             AND p.rowid=({_CURRENT_PAGE.format(url="p.url")})
             ORDER BY rank,p.source_origin,p.title,p.url LIMIT ?""",
                          (match, requested_origin, requested_origin, game_build, game_build, limit)).fetchall()
+        provenance = {row["url"]: _snapshot_provenance(row, db) for row in rows}
     results = []
     for row in rows:
         item = dict(row)
         item.pop("rank", None)
-        item.update({"status": "snapshot", **_snapshot_provenance(row),
+        item.update({"status": "snapshot", **provenance[row["url"]],
                      "source_links": [item["url"]], "game_build_state":
                          "provided" if item["game_build"] else "unspecified"})
         results.append(item)
@@ -834,6 +852,7 @@ def read_snapshot_page(db_path: Path | str, url: str, offset: int = 0) -> dict:
         row = db.execute(f"""SELECT p.*,s.file_format FROM snapshot_pages p
             JOIN snapshot_sources s ON s.source_id=p.source_id WHERE p.rowid=({_CURRENT_PAGE.format(url='?')})""",
                          (normalized,)).fetchone()
+        provenance = _snapshot_provenance(row, db) if row is not None else {}
     if row is None:
         return {"status": "not_found", "url": normalized}
     text = row["body"]
@@ -848,6 +867,6 @@ def read_snapshot_page(db_path: Path | str, url: str, offset: int = 0) -> dict:
         "namespace": row["namespace"], "namespace_name": row["namespace_name"],
         "redirect_target": row["redirect_target"], "game_build": row["game_build"],
         "game_build_state": "provided" if row["game_build"] else "unspecified",
-        "file_format": row["file_format"], **_snapshot_provenance(row),
+        "file_format": row["file_format"], **provenance,
         "links": json.loads(row["links_json"]), "source_id": row["source_id"],
     }

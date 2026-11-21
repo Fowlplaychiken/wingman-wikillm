@@ -41,6 +41,29 @@ class OfflineLibraryTests(unittest.TestCase):
         self.addCleanup(root.cleanup)
         self.db = Path(root.name) / "wiki.sqlite3"
 
+    def test_renamed_galactapedia_article_keeps_old_citation_and_revision_checks(self):
+        from wiki_llm.dependencies.wingman_wiki import corpus
+        from wiki_llm.dependencies.wingman_wiki.snapshots import import_snapshot
+        prefix = corpus.GALACTAPEDIA + "/article/"
+        old, new, different = (prefix + slug for slug in ("aBc-old", "aBc-new", "abc-other"))
+        with closing(sqlite3.connect(self.db)) as db, db:
+            db.executescript(corpus.SCHEMA)
+            corpus.apply_catalog(db, "galactapedia", {old: "Old"}, "2026-11-01")
+            corpus.apply_catalog(db, "galactapedia", {new: "New", different: "Other"}, "2026-11-02")
+        export = self.db.parent / "articles.jsonl"
+        export.write_text(json.dumps({"url": new, "title": "New", "text": "Publisher text.", "revision": 9}), encoding="utf-8")
+        import_snapshot(self.db, export)
+        manifest = self.db.parent / "inventory.jsonl"
+        manifest.write_text(json.dumps({"url": old, "revision": 9}), encoding="utf-8")
+        with patch.object(socket, "socket", side_effect=AssertionError("network access")):
+            page = read_page(self.db, old)
+            self.assertEqual((page["requested_url"], page["url"], page["text"]), (old, new, "Publisher text."))
+            self.assertEqual(check_inventory(self.db, manifest)["present"], 1)
+            self.assertFalse(read_page(self.db, prefix+"aBc-unseen").get("renamed"))
+            self.assertEqual(read_page(self.db, old, include_star_citizen=False)["status"], "unavailable")
+            manifest.write_text(json.dumps({"url": old, "revision": 8}), encoding="utf-8")
+            self.assertEqual(check_inventory(self.db, manifest)["revision_unverified"], 1)
+
     def test_cold_install_returns_both_actual_publishers_with_network_disabled(self):
         with patch.object(socket, "socket", side_effect=AssertionError("network access")):
             found = lookup(GUIDES, "Aberdeen visibility", db_path=self.db)
