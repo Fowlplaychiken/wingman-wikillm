@@ -154,7 +154,7 @@ def read_page(db_path, url, *, offset=0, include_star_citizen=True, roots=()):
         # A community citation may refer to an exact revision with a bounded cached excerpt.
         cached = _read(db_path, """SELECT p.title,p.extract,p.revision,s.url FROM pages p
             JOIN page_sources s ON p.pageid=s.pageid JOIN wiki_urls u ON u.url=s.url AND u.status='indexed'
-            WHERE s.publisher='Star Citizen Wiki' AND (s.url=? OR p.revision=?) LIMIT 1""",
+            WHERE s.publisher='Star Citizen Wiki' AND p.extract!='' AND (s.url=? OR p.revision=?) LIMIT 1""",
             (url, int(permanent[1]) if permanent else None), "page_sources")
         if cached:
             item = cached[0]
@@ -207,10 +207,12 @@ def library_status(db_path=None, *, include_star_citizen=True, roots=()):
         catalog_names = ("community", "support", "official", "galactapedia")
         last_updates = {row["name"]: row for row in _read(
             path, "SELECT name,last_success,last_error FROM refresh_catalogs", (), "refresh_catalogs")}
-        for row in _read(path, "SELECT url,pageid FROM wiki_urls WHERE status!='removed'", (), "wiki_urls"):
+        for row in _read(path, """SELECT u.url, coalesce(p.extract != '', 0) AS has_excerpt
+                FROM wiki_urls u LEFT JOIN pages p ON p.pageid=u.pageid
+                WHERE u.status!='removed'""", (), "wiki_urls"):
             group = counts.setdefault(corpus.catalog_owner(row["url"]), {"titles": 0, "excerpts": 0, "full_text_for_known_urls": 0, "missing_full_text": 0})
             group["titles"] += 1
-            group["excerpts"] += row["pageid"] is not None
+            group["excerpts"] += row["has_excerpt"]
             group["full_text_for_known_urls"] += row["url"] in full
             group["missing_full_text"] += row["url"] not in full
         for name in catalog_names:

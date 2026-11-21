@@ -322,7 +322,7 @@ class WikiReference:
                     "JOIN pages ON pages.pageid = page_search.rowid "
                     "LEFT JOIN page_sources ON page_sources.pageid = pages.pageid "
                     "JOIN wiki_urls ON wiki_urls.url = page_sources.url "
-                    "WHERE page_search MATCH ? "
+                    "WHERE page_search MATCH ? AND pages.extract != '' "
                     "AND wiki_urls.status = 'indexed' "
                     "AND page_sources.publisher = 'Star Citizen Wiki' "
                     "ORDER BY bm25(page_search), pages.title LIMIT ?",
