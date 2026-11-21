@@ -63,14 +63,20 @@ CREATE INDEX IF NOT EXISTS web_copy_license ON web_publisher_copies(license_url)
 _NATIVE = ("starcitizen.tools", "robertsspaceindustries.com")
 _BLOCKED_NAMESPACE = re.compile(r"(?:^|/)(?:special|user(?:_talk)?|talk|file|image|mediawiki|template)(?::|%3a)", re.I)
 _ASSET = re.compile(r"\.(?:jpg|jpeg|png|gif|webp|svg|ico|mp[34]|wav|ogg|webm|pdf|zip|gz|css|js|json|xml|woff2?|ttf)(?:$|/)", re.I)
-_ADMIN = re.compile(r"(?:^|/)(?:admin|wp-admin|wp-login\.php|login|logout|api(?:\.php)?|graphql|xmlrpc\.php|edit|history|search)(?:/|$)", re.I)
+_ADMIN = re.compile(r"(?:^|/)(?:admin|login|logout|wp-admin|wp-login\.php|api\.php|xmlrpc\.php)(?:/|$)", re.I)
+_ADMIN_ROOT = re.compile(r"^/(?:admin|login|logout|api|graphql|edit|history|search)(?:/|$)", re.I)
 _LICENSE = re.compile(r"^https?://(?:www\.)?creativecommons\.org/(?:licenses/(by|by-sa)/(\d\.\d)|publicdomain/zero/(1\.0))/?$", re.I)
 _ALLPAGES = {"action": "query", "format": "json", "list": "allpages", "apnamespace": "0",
              "aplimit": "50", "apfilterredir": "nonredirects"}
 _NAMESPACE_INFO = {"meta": "siteinfo", "siprop": "namespaces"}
 
 
-def _url(value):
+def _admin_endpoint(path):
+    """Recognize endpoint routes, not ordinary words inside article paths."""
+    return bool(_ADMIN.search(path) or _ADMIN_ROOT.match(path))
+
+
+def _url(value, *, mediawiki_endpoint=False):
     if not isinstance(value, str) or not value or len(value) > 2000 or any(c.isspace() or ord(c) < 32 for c in value):
         raise ValueError("Use a public HTTPS wiki URL without spaces")
     p = urlsplit(value)
@@ -98,6 +104,9 @@ def _url(value):
         raise ValueError("Ambiguous wiki path")
     if any(ord(c) < 32 for c in decoded):
         raise ValueError("Invalid wiki path")
+    route = decoded.removesuffix("/api.php") if mediawiki_endpoint else decoded
+    if _admin_endpoint(route):
+        raise ValueError("Wiki admin endpoints are not article URLs")
     query = ""
     if p.query:
         try:
@@ -111,7 +120,7 @@ def _url(value):
                 or "\\" in title or re.search(r"%[0-9a-f]{2}", title, re.I)
                 or any(part in (".", "..") for part in title.split("/"))):
             raise ValueError("Invalid MediaWiki article title")
-        if _BLOCKED_NAMESPACE.search("/" + title) or _ADMIN.search("/" + title) or _ASSET.search(title):
+        if _BLOCKED_NAMESPACE.search("/" + title) or _ASSET.search(title):
             raise ValueError("Choose a public MediaWiki article title")
         query = urlencode({"title": title}, quote_via=quote, safe=":/")
     return urlunsplit(("https", host, quote(path, safe="/:@-._~!$&'()*+,;=%"), query, ""))
@@ -133,7 +142,7 @@ def parse_roots(text) -> tuple[str, ...]:
         if not line.strip() or line.lstrip().startswith("#"):
             continue
         url = _url(pasted_address(line.strip()))
-        if (_ADMIN.search(unquote(urlsplit(url).path)) or _ASSET.search(urlsplit(url).path)
+        if (_admin_endpoint(unquote(urlsplit(url).path)) or _ASSET.search(urlsplit(url).path)
                 or _BLOCKED_NAMESPACE.search(unquote(urlsplit(url).path))):
             raise ValueError("Choose a wiki base or article page")
         if url not in seen:
@@ -168,7 +177,7 @@ def _article(root, link):
     if p.netloc != origin.netloc or not scoped:
         return None
     path = unquote(p.path)
-    if _ASSET.search(path) or _ADMIN.search(path) or _BLOCKED_NAMESPACE.search(path):
+    if _ASSET.search(path) or _admin_endpoint(path) or _BLOCKED_NAMESPACE.search(path):
         return None
     return url
 
@@ -189,7 +198,7 @@ def _network_url(url):
         return _url(url)
     except ValueError:
         parsed = urlsplit(url)
-        base = _url(urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", "")))
+        base = _url(urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", "")), mediawiki_endpoint=True)
         pairs = parse_qsl(parsed.query, keep_blank_values=True, strict_parsing=True)
         fields = dict(pairs)
         namespace = fields.get("apnamespace", "")
@@ -208,7 +217,7 @@ def _api_endpoint(root, edit_uri):
     """Accept only a publisher-declared MediaWiki EditURI in this wiki family."""
     try:
         parsed = urlsplit(urljoin(root, edit_uri))
-        endpoint = _url(urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", "")))
+        endpoint = _url(urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", "")), mediawiki_endpoint=True)
         fields = parse_qsl(parsed.query, keep_blank_values=True, strict_parsing=True)
     except ValueError:
         return None
@@ -219,7 +228,7 @@ def _api_endpoint(root, edit_uri):
         family = family[:-2]
     if (urlsplit(endpoint).netloc != urlsplit(root).netloc or not parsed.path.endswith("/api.php")
             or not parsed.path.startswith(family) or fields not in ([], [("action", "rsd")])
-            or _ADMIN.search(parsed.path.rsplit("/", 1)[0])):
+            or _admin_endpoint(parsed.path.rsplit("/", 1)[0])):
         return None
     return endpoint
 
@@ -502,7 +511,7 @@ class _Contact:
                 raise ValueError("Public wiki redirect limit or missing target")
             target = _url(urljoin(url, location))
             if (urlsplit(target).netloc != host or target in seen or not _allowed(rules, target)
-                    or _ADMIN.search(unquote(urlsplit(target).path))):
+                    or _admin_endpoint(unquote(urlsplit(target).path))):
                 raise ValueError("Public wiki redirect leaves origin, cycles or is disallowed")
             url = target
             headers = None  # A validator belongs to the originally requested URI.
@@ -739,7 +748,7 @@ def _discover(db, contact, root, rules):
             return
         if (urlsplit(url).netloc == urlsplit(root).netloc and _allowed(rules, url)
                 and re.search(r"\.xml(?:\.gz)?$", urlsplit(url).path, re.I)
-                and not _ADMIN.search(unquote(urlsplit(url).path))):
+                and not _admin_endpoint(unquote(urlsplit(url).path))):
             db.execute("INSERT OR IGNORE INTO web_sitemaps(root,url) VALUES(?,?)", (root, url))
     with db:
         for url in sitemap_urls:
@@ -851,7 +860,7 @@ def _license_link(declarations, article_url):
     except ValueError:
         return None
     parts = urlsplit(url)
-    if parts.netloc != urlsplit(article_url).netloc or _ADMIN.search(unquote(parts.path)):
+    if parts.netloc != urlsplit(article_url).netloc or _admin_endpoint(unquote(parts.path)):
         return None
     return url
 

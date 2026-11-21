@@ -24,6 +24,7 @@ _SCHEMA = """CREATE TABLE IF NOT EXISTS source_choices(
     kind TEXT NOT NULL, url TEXT NOT NULL, added_definition TEXT,
     enabled INTEGER NOT NULL CHECK(enabled IN (0,1)),
     setting_at_change INTEGER CHECK(setting_at_change IN (0,1)),
+    removed INTEGER NOT NULL DEFAULT 0 CHECK(removed IN (0,1)),
     PRIMARY KEY(kind,url))"""
 
 
@@ -74,17 +75,21 @@ def _choices(connection, configured):
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='source_choices'"
     ).fetchone():
         return result
-    for kind, url, definition, enabled, baseline in connection.execute(
-        "SELECT kind,url,added_definition,enabled,setting_at_change FROM source_choices ORDER BY rowid"
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(source_choices)")}
+    removed_column = "removed" if "removed" in columns else "0"
+    for kind, url, definition, enabled, baseline, removed in connection.execute(
+        f"SELECT kind,url,added_definition,enabled,setting_at_change,{removed_column} FROM source_choices ORDER BY rowid"
     ):
         key = (kind, url)
         entry = configured.get(key)
         if entry is not None:
             # A new setting, or changing its # prefix after a voice command,
             # takes precedence over the earlier choice.
-            if baseline == entry.enabled:
+            if removed and baseline == entry.enabled:
+                del result[key]
+            elif baseline == entry.enabled:
                 result[key] = _Source(entry.value, bool(enabled), "settings")
-        elif definition is not None:
+        elif definition is not None and not removed:
             result[key] = _Source(_one(kind, definition), bool(enabled), "voice")
     return result
 
@@ -114,9 +119,9 @@ def _result(choices, status, message):
 
 
 def manage_source(db, action, source=None, kind="wiki", roots=(), feeds=()):
-    """List, add, pause, or resume one source. All operations are local."""
-    if kind not in ("wiki", "api") or action not in ("list", "add", "pause", "resume"):
-        raise ValueError("Choose list, add, pause, or resume and a source kind of wiki or api.")
+    """Manage the player's source list independently of saved articles and field notes."""
+    if kind not in ("wiki", "api") or action not in ("list", "add", "pause", "resume", "remove"):
+        raise ValueError("Choose list, add, pause, resume, or remove and a source kind of wiki or api.")
     configured = _configured(roots, feeds)
     if action == "list":
         choices = _read_choices(db, configured)
@@ -130,6 +135,8 @@ def manage_source(db, action, source=None, kind="wiki", roots=(), feeds=()):
     with closing(sqlite3.connect(path, timeout=3)) as conn, conn:
         conn.execute("BEGIN IMMEDIATE")
         conn.execute(_SCHEMA)
+        if "removed" not in {row[1] for row in conn.execute("PRAGMA table_info(source_choices)")}:
+            conn.execute("ALTER TABLE source_choices ADD COLUMN removed INTEGER NOT NULL DEFAULT 0 CHECK(removed IN (0,1))")
         choices = _choices(conn, configured)
         current = choices.get((kind, url))
         if action == "add" and current:
@@ -137,16 +144,22 @@ def manage_source(db, action, source=None, kind="wiki", roots=(), feeds=()):
             return _result(choices, state, f"{url} is already {state}.")
         if action != "add" and current is None:
             return _result(choices, "not_found", f"{url} is not in this library's extra sources.")
+        setting = configured.get((kind, url))
+        if action == "remove":
+            conn.execute("DELETE FROM source_choices WHERE kind=? AND url=?", (kind, url))
+            if setting is not None:
+                conn.execute("""INSERT INTO source_choices(kind,url,enabled,setting_at_change,removed)
+                                VALUES(?,?,0,?,1)""", (kind, url, setting.enabled))
+            return _result(_choices(conn, configured), "removed", f"Removed {url} from your source list. Your saved data is still on this computer.")
         added = None
         if action == "add":
             added = json.dumps(asdict(value)) if isinstance(value, JsonFeed) else value
         enabled = (not commented) if action == "add" else action == "resume"
-        setting = configured.get((kind, url))
         conn.execute("""
             INSERT INTO source_choices(kind,url,added_definition,enabled,setting_at_change)
             VALUES(?,?,?,?,?) ON CONFLICT(kind,url) DO UPDATE SET
               added_definition=COALESCE(excluded.added_definition,source_choices.added_definition),
-              enabled=excluded.enabled,setting_at_change=excluded.setting_at_change
+              enabled=excluded.enabled,setting_at_change=excluded.setting_at_change,removed=0
             """, (kind, url, added, enabled, setting.enabled if setting else None))
         state = "active" if enabled else "paused"
         return _result(_choices(conn, configured), state, f"{url} is now {state}.")

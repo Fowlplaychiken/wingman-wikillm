@@ -23,7 +23,7 @@ Ask **“How much of the Galactapedia do we have on board?”** for actual cover
 
 Paste its **home address** in Wingman chat and say **“Add this wiki to my library.”** You can also paste one address per line in **WikiLLM settings → Other game wikis**. Keep Star Citizen alongside it or switch off **Use the Star Citizen library**.
 
-Say **“List my extra wikis,” “Pause the Wesnoth wiki,”** or **“Resume the Wesnoth wiki.”** Pausing hides that source and keeps its saved pages for later. WikiLLM follows nested sections, links, sitemaps and accessible MediaWiki article lists. What it can save depends on what the publisher makes available. [Game APIs, full exports and coverage checks](docs/sources.md)
+Say **“List my extra wikis,” “Pause the Wesnoth wiki,” “Resume the Wesnoth wiki,”** or **“Remove the Wesnoth wiki.”** Pausing stops updates and hides its articles. Removing it also takes it off your list. You can add it back to use its saved pages again. WikiLLM follows nested links, sitemaps and accessible MediaWiki article lists. [Game APIs, full exports and coverage checks](docs/sources.md)
 
 ## Your field notes
 
