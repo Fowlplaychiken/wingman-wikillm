@@ -16,6 +16,8 @@ FILES = (
     "guides/getting-started-flight.md", "guides/industrial-careers.md",
     "guides/missions-survival-exploration.md", "guides/wingman-modules.md",
 )
+# Repository-owned binary assets are deliberately separate from UTF-8 sources.
+BINARY_FILES = ("docs/field-guide.webp",)
 
 
 def package_members(version):
@@ -29,6 +31,8 @@ def package_members(version):
         members[name.replace("dependencies/wingman_wiki/", f"dependencies/{namespace}/")] = content.encode()
     for name in ("LICENSE", "README.md"):
         members[name] = (ROOT / name).read_text(encoding="utf-8").encode()
+    for name in BINARY_FILES:
+        members[name] = (ROOT / name).read_bytes()
     return members
 
 
