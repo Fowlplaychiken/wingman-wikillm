@@ -111,7 +111,13 @@ class OfflineLibraryTests(unittest.TestCase):
             self.assertEqual([r["citation"] for r in hit], [url])
             self.assertIn("Coal", read_page(self.db, url, **options)["text"])
             self.assertEqual(read_page(self.db, pages[1]["url"], **options)["status"], "unavailable")
-            self.assertEqual(library_status(self.db, **options)["imported_articles"][0]["saved_articles"], 1)
+            status = library_status(self.db, **options)
+            self.assertEqual(status["imported_articles"][0]["saved_articles"], 1)
+            self.assertEqual(status["coverage_totals"]["star_citizen_preset"], {"enabled": False})
+            self.assertEqual(status["coverage_totals"]["all_enabled_local_imports"],
+                             {"unique_article_urls": 1})
+            self.assertIn("built-in preset is disabled", status["coverage_summary"])
+            self.assertIn("Private notes are excluded", status["coverage_summary"])
             self.assertFalse(lookup(GUIDES, "locomotive", db_path=self.db, roots=())["references"])
             self.assertTrue(lookup(GUIDES, "Aberdeen", db_path=self.db, roots=(base,))["references"])
             record_note("my-railway", "My railway", "I named my locomotive Grebe.", status="reviewed", db_path=self.db)
@@ -158,13 +164,53 @@ class OfflineLibraryTests(unittest.TestCase):
 
         refresh.refresh_once(self.db, publisher=CommunityPublisher(), clock=lambda: 1000,
                              enabled_catalogs=("community",))
-        export = self.db.parent / "authorized-community.jsonl"
-        export.write_text(json.dumps({"url": article, "title": "Coverage",
-            "text": "Authorized local export contains the complete article text."}), encoding="utf-8")
-        import_snapshot(self.db, export)
-        community = library_status(self.db)["star_citizen_library"]["community"]
+        other_catalog_urls = (
+            "https://robertsspaceindustries.com/comm-link/engineering/12345-Ship",
+            "https://support.robertsspaceindustries.com/hc/en-us/articles/12345-Ship",
+            "https://robertsspaceindustries.com/galactapedia/article/abcdefghij-sample",
+        )
+        with closing(sqlite3.connect(self.db)) as db, db:
+            db.executemany("INSERT INTO wiki_urls(url,lastmod,pageid,checked_at,status) "
+                           "VALUES(?,NULL,NULL,NULL,'indexed')",
+                           ((url,) for url in other_catalog_urls))
+
+        imported_rows = [
+            {"url": article, "title": "Coverage",
+             "text": "Authorized local export contains the complete article text."},
+            {"url": other_catalog_urls[0], "title": "Ship engineering",
+             "text": "Authorized RSI local export contains complete article text."},
+        ]
+        for name, row in (("authorized-community-a", imported_rows[0]),
+                          ("authorized-community-b", imported_rows[0]),
+                          ("authorized-rsi", imported_rows[1])):
+            export = self.db.parent / f"{name}.jsonl"
+            export.write_text(json.dumps(row), encoding="utf-8")
+            import_snapshot(self.db, export)
+        record_note("private-test-note", "Private test note", "This stays outside source coverage.",
+                    status="reviewed", db_path=self.db)
+
+        status = library_status(self.db)
+        community = status["star_citizen_library"]["community"]
         self.assertEqual((community["indexed_titles"], community["saved_excerpts"],
                           community["full_text_articles"], community["missing_full_text"]), (1, 1, 1, 0))
+        self.assertEqual(status["coverage_totals"], {
+            "star_citizen_preset": {
+                "enabled": True,
+                "unique_known_title_urls": 4,
+                "saved_community_excerpt_urls": 1,
+                "full_text_for_known_urls": 2,
+                "missing_full_text_for_known_urls": 2,
+            },
+            "all_enabled_local_imports": {"unique_article_urls": 2},
+            "private_notes": {"included_in_coverage_totals": False},
+        })
+        self.assertEqual(status["coverage_summary"],
+            "Star Citizen built-in preset: 4 unique known title URLs "
+            "(community 1; support 1; official 1; galactapedia 1); "
+            "1 saved community excerpt URLs; full text for 2 of 4 known URLs, with 2 missing. "
+            "Separately, 2 distinct local imported article URLs are enabled across all selected sources "
+            "(see imported_articles by origin); imports can overlap known-URL coverage and are not added "
+            "to the preset total. Private notes are excluded from coverage totals.")
 
     def test_new_evidence_marks_note_until_reviewed_again_on_same_day(self):
         url = "https://wiki.example.org/rail/Engine"

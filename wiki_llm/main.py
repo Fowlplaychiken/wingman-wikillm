@@ -66,7 +66,7 @@ class WingmanWikiLLM(Skill):
             result = {"status": "invalid_request", "reason": str(exc)}
         return json.dumps(result, ensure_ascii=False)
 
-    @tool(name="wikillm_library_status", description="Report enabled wiki sources and how much is available offline.", summarize=False)
+    @tool(name="wikillm_library_status", description="Report enabled wiki sources and offline coverage. Quote coverage_summary verbatim for totals; do not add the per-source catalog counts yourself. Keep full text for known URLs separate from all local imports. Imports may overlap known URLs and must not be added to preset totals. Private notes are excluded from coverage totals.", summarize=False)
     async def wiki_library_status(self) -> str:
         """Read local sync and coverage information."""
         result = await asyncio.to_thread(library_status, include_star_citizen=self._sc, roots=self._roots)
