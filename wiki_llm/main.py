@@ -30,7 +30,8 @@ class WingmanWikiLLM(Skill):
             community_db_path(), interval=setting("refresh_interval_hours", 1)*3600,
             catch_up=setting("catch_up", True), batch_size=int(pages),
             enabled_catalogs=None if online and self._sc else (),
-            roots=self._roots if online else (), import_snapshots=True)
+            roots=self._roots if online else (), import_snapshots=True,
+            include_sc_edition=self._sc)
         self._refresh.start()
 
     async def unload(self):
@@ -77,6 +78,8 @@ class WingmanWikiLLM(Skill):
             if report and "imports" in report.sources:
                 result["import_errors"] = [row.get("error_type") for row in
                                            report.sources["imports"].get("sources", []) if row.get("status") == "error"]
+            if report and "community_archive" in report.sources:
+                result["community_archive_download"] = report.sources["community_archive"]
         return json.dumps(result, ensure_ascii=False)
 
     @tool(name="wikillm_record_note", description="Maintain this player's local wiki as you discover a useful new fact or correction during research. Save a draft for uncertainty or conflicting evidence. Use reviewed for checked evidence or an explicit player observation. Cite the original public URL where available. Exclude secrets and unrelated conversation.", summarize=False)

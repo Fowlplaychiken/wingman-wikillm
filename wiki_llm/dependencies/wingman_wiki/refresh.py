@@ -276,7 +276,8 @@ def snapshot_limits():
 def refresh_once(db_path: str | Path, *, batch_size: int = 5,
                  catalog_interval: float = 86_400, page_interval: float = 604_800,
                  publisher=None, stop_event: threading.Event | None = None,
-                 clock=time.time, enabled_catalogs=None, roots=(), import_snapshots=False) -> RefreshReport:
+                 clock=time.time, enabled_catalogs=None, roots=(), import_snapshots=False,
+                 include_sc_edition=False) -> RefreshReport:
     """One leased refresh for a per-user DB; stale lease recovers after 120 s.
 
     A small heartbeat renews during bounded network reads. Losing the lease
@@ -286,7 +287,9 @@ def refresh_once(db_path: str | Path, *, batch_size: int = 5,
         return RefreshReport(cancelled=True)
     enabled = _enabled_catalogs(enabled_catalogs)
     path = Path(db_path).expanduser()
-    if not enabled and not roots and import_snapshots and not (path.parent / "snapshots").exists():
+    from .snapshots import bundled_edition, sync_snapshots
+    edition = bundled_edition() if include_sc_edition and import_snapshots else None
+    if not enabled and not roots and import_snapshots and edition is None and not (path.parent / "snapshots").exists():
         return RefreshReport()
     path.parent.mkdir(parents=True, exist_ok=True)
     token = uuid.uuid4().hex
@@ -332,9 +335,8 @@ def refresh_once(db_path: str | Path, *, batch_size: int = 5,
                 report.sources["wikis"] = {"status": "failed", "error_type": type(exc).__name__}
                 report.failed += 1
         if import_snapshots and not cancellation.is_set():
-            from .snapshots import sync_snapshots
             try:
-                report.sources["imports"] = sync_snapshots(path, **snapshot_limits())
+                report.sources["imports"] = sync_snapshots(path, packaged_edition=edition, **snapshot_limits())
                 report.failed += sum(row.get("status") == "error" for row in report.sources["imports"]["sources"])
             except (OSError, ValueError, sqlite3.Error) as exc:
                 report.sources["imports"] = {"status": "failed", "error_type": type(exc).__name__}

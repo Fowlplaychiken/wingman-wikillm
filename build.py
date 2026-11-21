@@ -12,7 +12,8 @@ FILES = (
     "dependencies/wingman_wiki/__init__.py", "dependencies/wingman_wiki/reference.py",
     "dependencies/wingman_wiki/library.py", "dependencies/wingman_wiki/corpus.py",
     "dependencies/wingman_wiki/refresh.py", "dependencies/wingman_wiki/web_sources.py",
-    "dependencies/wingman_wiki/snapshots.py", "dependencies/wingman_wiki/coverage.py", "guides/README.md",
+    "dependencies/wingman_wiki/snapshots.py", "dependencies/wingman_wiki/sc_archive.py",
+    "dependencies/wingman_wiki/coverage.py", "guides/README.md",
     "guides/environmental-indicators.md", "guides/engineering-displays.md",
     "guides/getting-started-flight.md", "guides/industrial-careers.md",
     "guides/missions-survival-exploration.md", "guides/wingman-modules.md",
@@ -37,13 +38,19 @@ def package_members(version):
     return members
 
 
-def build(directory):
+def build(directory, *, edition=None):
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     version = re.search(r"^version: ([0-9]+\.[0-9]+\.[0-9]+)$",
                         (PACKAGE / "default_config.yaml").read_text(encoding="utf-8"), re.M)[1]
     archive = directory / f"wiki_llm-{version}.zip"
     members = package_members(version)
+    if edition is not None:
+        from wiki_llm.dependencies.wingman_wiki.snapshots import EDITION_FILENAME, EDITION_SHA256
+        data = Path(edition).read_bytes()
+        if hashlib.sha256(data).hexdigest() != EDITION_SHA256:
+            raise ValueError("The prepared public edition does not match its release checksum.")
+        members["editions/" + EDITION_FILENAME] = data
     with zipfile.ZipFile(archive, "w") as bundle:
         for name, data in sorted(members.items()):
             entry = zipfile.ZipInfo("wiki_llm/" + name, (1980, 1, 1, 0, 0, 0))
@@ -59,5 +66,10 @@ def build(directory):
 if __name__ == "__main__":
     cli = argparse.ArgumentParser(description=__doc__)
     cli.add_argument("--out", type=Path, default=ROOT / "dist")
-    archive = build(cli.parse_args().out)
+    cli.add_argument("--edition", type=Path, default=ROOT / "dist/sc-archive-20230930/starcitizen.tools-20230930-articles.jsonl.gz",
+                     help="Verified article file from prepare_sc_edition.py")
+    args = cli.parse_args()
+    if not args.edition.is_file():
+        cli.error("Prepare the September 2023 edition first, or pass --edition with the prepared file.")
+    archive = build(args.out, edition=args.edition)
     print(f"{hashlib.sha256(archive.read_bytes()).hexdigest()}  {archive}")

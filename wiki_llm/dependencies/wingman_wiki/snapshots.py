@@ -12,7 +12,8 @@ import gzip
 from html.parser import HTMLParser
 import ipaddress
 from datetime import datetime, timezone
-from contextlib import closing
+from collections import Counter
+from contextlib import ExitStack, closing
 import io
 import json
 import os
@@ -22,6 +23,16 @@ import sqlite3
 from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlsplit, urlunsplit
 import xml.etree.ElementTree as ET
 import zlib
+
+from . import sc_archive
+
+EDITION_FILENAME = "starcitizen.tools-20230930-articles.jsonl.gz"
+EDITION_SHA256 = "ca221b01fbab2d8968b259525457006e560d1c6e06460e3d2998ee2fc2661ead"
+
+
+def bundled_edition():
+    path = Path(__file__).resolve().parents[2] / "editions" / EDITION_FILENAME
+    return path if path.is_file() else None
 
 
 # Defaults are sized for a normal personal wiki export. Callers importing a
@@ -86,6 +97,36 @@ CREATE VIRTUAL TABLE IF NOT EXISTS snapshot_search USING fts5(
     tokenize='porter unicode61'
 );
 """
+
+
+# Search and direct reads choose from all versions of the URL, including those
+# whose text does not match the query. Numeric revision IDs are comparable when
+# all copies have them. Otherwise prefer a dated copy, normalizing time zones.
+_CURRENT_PAGE = """
+    SELECT page_rowid FROM (
+        SELECT c.rowid AS page_rowid, c.page_key, c.source_id, s.imported_at,
+               snapshot_timestamp(c.revision_timestamp) AS stamp,
+               CASE WHEN c.revision <> '' AND c.revision NOT GLOB '*[^0-9]*'
+                    THEN ltrim(c.revision, '0') END AS digits
+        FROM snapshot_pages c JOIN snapshot_sources s ON s.source_id=c.source_id
+        WHERE c.url={url}
+    )
+    ORDER BY CASE WHEN count(digits) OVER () < count(*) OVER () THEN stamp END DESC,
+             length(digits) DESC, digits DESC, stamp DESC, imported_at DESC, source_id, page_key
+    LIMIT 1
+"""
+
+
+def _snapshot_timestamp(value: str | None) -> str | None:
+    if not value:
+        return None
+    try:
+        stamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=timezone.utc)
+        return stamp.astimezone(timezone.utc).isoformat(timespec="microseconds")
+    except (ValueError, OverflowError):
+        return None
 
 
 class SnapshotError(ValueError):
@@ -177,7 +218,10 @@ def _stable_hash(path: Path, max_compressed_bytes: int | None) -> tuple[str, os.
 
 
 def _stat_key(value: os.stat_result) -> tuple[int, int, int, int, int]:
-    return value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns
+    # Windows path and handle stats can differ on ctime. Birth time is consistent
+    # across both, and both content passes still compare SHA-256.
+    stamp = getattr(value, "st_birthtime_ns", value.st_ctime_ns) if os.name == "nt" else value.st_ctime_ns
+    return value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, stamp
 
 
 def _query(query: object) -> tuple[str, ...]:
@@ -313,7 +357,8 @@ def _iter_xml_pages(stream, insert_page, max_pages: int | None):
                 if len(body) > MAX_PAGE_CHARS:
                     raise SnapshotError("MediaWiki page exceeds the per-page size limit")
                 revision_num = int(revision_id) if revision_id and revision_id.isdecimal() else None
-                rank = (1, revision_num, timestamp or "") if revision_num is not None else (0, timestamp or "")
+                stamp = _snapshot_timestamp(timestamp) or ""
+                rank = (1, revision_num, stamp) if revision_num is not None else (0, stamp)
                 if page["revision_key"] is None or rank > page["revision_key"]:
                     page["revision_key"] = rank
                     page["revision"] = revision_id
@@ -365,9 +410,7 @@ def _iter_xml_pages(stream, insert_page, max_pages: int | None):
     return base, page_count
 
 
-def _jsonl_pages(stream, insert_page, max_pages: int | None):
-    page_count = 0
-    source_origin: str | None = None
+def _jsonl_records(stream):
     line_number = 0
     while True:
         raw_line = stream.readline(MAX_JSONL_LINE_BYTES + 1)
@@ -386,6 +429,13 @@ def _jsonl_pages(stream, insert_page, max_pages: int | None):
             article = json.loads(line)
         except json.JSONDecodeError as error:
             raise SnapshotError(f"JSONL line {line_number} is invalid") from error
+        yield line_number, article
+
+
+def _stage_articles(records, insert_page, max_pages: int | None):
+    page_count = 0
+    source_origin: str | None = None
+    for line_number, article in records:
         if not isinstance(article, dict):
             raise SnapshotError(f"JSONL line {line_number} must be an object")
         url, origin = _public_url(article.get("url"), https_only=True)
@@ -485,6 +535,10 @@ class _ExpandedReader(io.RawIOBase):
 
 def _file_format(path: Path) -> tuple[str, str | None]:
     name = path.name.casefold()
+    if name == sc_archive.ARCHIVE_FILENAME:
+        return "starcitizen-archive-20230930", "zstd"
+    if name == EDITION_FILENAME:
+        return "starcitizen-archive-20230930", "gzip"
     if name.endswith(".xml.gz"):
         return "mediawiki-xml-gzip", "gzip"
     if name.endswith(".xml.bz2"):
@@ -519,6 +573,11 @@ def import_snapshot(db_path: Path | str, path: Path | str, *,
     max_pages = _validate_limit(max_pages, "max_pages")
     file_format, compression = _file_format(source_path)
     digest, original_stat = _stable_hash(source_path, max_compressed_bytes)
+    archive_counts = Counter()
+    if file_format == "starcitizen-archive-20230930":
+        expected_digest = sc_archive.SHA256 if compression == "zstd" else EDITION_SHA256
+        if digest != expected_digest:
+            raise SnapshotError("The Star Citizen archive does not match the published edition.")
     source_id = _source_id(source_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     with closing(sqlite3.connect(db_path, timeout=10)) as db:
@@ -544,7 +603,7 @@ def import_snapshot(db_path: Path | str, path: Path | str, *,
                 raise SnapshotError("snapshot contains a duplicate page identity") from error
 
         try:
-            with source_path.open("rb") as stream:
+            with source_path.open("rb") as stream, ExitStack() as filters:
                 opened = os.fstat(stream.fileno())
                 if _stat_key(original_stat) != _stat_key(opened):
                     raise SnapshotError("snapshot changed before parsing")
@@ -554,16 +613,23 @@ def import_snapshot(db_path: Path | str, path: Path | str, *,
                     decoded_stream = gzip.GzipFile(fileobj=compressed_stream, mode="rb")
                 elif compression == "bzip2":
                     decoded_stream = bz2.BZ2File(compressed_stream, mode="rb")
+                elif compression == "zstd":
+                    decoded_stream = sc_archive.open_zstd(compressed_stream)
                 else:
                     decoded_stream = compressed_stream
+                filters.enter_context(decoded_stream)
                 bounded_stream = io.BufferedReader(_ExpandedReader(
                     decoded_stream, max_bytes=max_expanded_bytes,
-                    xml_mode=file_format.startswith("mediawiki-xml")))
-                if file_format.startswith("mediawiki-xml"):
-                    base, page_count = _iter_xml_pages(bounded_stream, stage, max_pages)
-                    source_origin = _public_url(base)[1]
-                else:
-                    source_origin, page_count = _jsonl_pages(bounded_stream, stage, max_pages)
+                    xml_mode=file_format.startswith("mediawiki-xml") or compression == "zstd"))
+                with bounded_stream:
+                    if file_format.startswith("mediawiki-xml"):
+                        base, page_count = _iter_xml_pages(bounded_stream, stage, max_pages)
+                        source_origin = _public_url(base)[1]
+                    elif compression == "zstd":
+                        records = enumerate(sc_archive.iter_articles(bounded_stream, archive_counts), 1)
+                        source_origin, page_count = _stage_articles(records, stage, max_pages)
+                    else:
+                        source_origin, page_count = _stage_articles(_jsonl_records(bounded_stream), stage, max_pages)
                 after = os.fstat(stream.fileno())
             path_after = source_path.stat()
             if _stat_key(original_stat) != _stat_key(after) or _stat_key(after) != _stat_key(path_after):
@@ -627,11 +693,14 @@ def import_snapshot(db_path: Path | str, path: Path | str, *,
             if db.in_transaction:
                 db.rollback()
             raise
-    return {"status": "imported", "source_id": source_id,
-            "file_format": file_format, "page_count": page_count}
+    report = {"status": "imported", "source_id": source_id,
+              "file_format": file_format, "page_count": page_count}
+    if compression == "zstd":
+        report["archive_counts"] = dict(archive_counts)
+    return report
 
 
-def sync_snapshots(db_path: Path | str, *,
+def sync_snapshots(db_path: Path | str, *, packaged_edition: Path | None = None,
                    max_compressed_bytes: int | None = DEFAULT_MAX_COMPRESSED_BYTES,
                    max_expanded_bytes: int | None = DEFAULT_MAX_EXPANDED_BYTES,
                    max_pages: int | None = DEFAULT_MAX_PAGES) -> dict:
@@ -645,12 +714,15 @@ def sync_snapshots(db_path: Path | str, *,
     max_pages = _validate_limit(max_pages, "max_pages")
     database = Path(db_path).expanduser()
     directory = database.parent / "snapshots"
-    if not directory.exists():
+    if not directory.exists() and packaged_edition is None:
         return {"status": "empty", "directory": str(directory), "sources": []}
-    if not directory.is_dir():
+    if directory.exists() and not directory.is_dir():
         raise SnapshotError("snapshot source path must be a directory")
     results = []
-    for path in sorted(directory.iterdir(), key=lambda item: item.name.casefold()):
+    paths = sorted(directory.iterdir(), key=lambda item: item.name.casefold()) if directory.is_dir() else []
+    if packaged_edition is not None:
+        paths.insert(0, packaged_edition)
+    for path in paths:
         if not path.is_file():
             continue
         try:
@@ -666,6 +738,21 @@ def sync_snapshots(db_path: Path | str, *,
                             "error_type": type(error).__name__,
                             "error": str(error) or repr(error)})
     return {"status": "synced", "directory": str(directory), "sources": results}
+
+
+def _snapshot_provenance(row: sqlite3.Row) -> dict:
+    source = {"source_kind": "user_supplied_snapshot", "citation": row["url"], "live_state": False}
+    if row["file_format"] == "starcitizen-archive-20230930":
+        history = urlencode({"title": row["title"].replace(" ", "_"), "action": "history"})
+        source.update({
+            "source_kind": "historical_community_archive",
+            "publisher": sc_archive.ATTRIBUTION, "edition_date": sc_archive.SNAPSHOT_DATE,
+            "archive_url": sc_archive.ARCHIVE_URI,
+            "license": "CC BY-SA 4.0", "license_url": sc_archive.LICENSE_URL,
+            "attribution": "Star Citizen Wiki contributors, CC BY-SA 4.0",
+            "attribution_url": "https://starcitizen.tools/index.php?" + history,
+        })
+    return source
 
 
 def search_snapshots(query: object, db_path: Path | str, limit: int = 3, *,
@@ -691,25 +778,27 @@ def search_snapshots(query: object, db_path: Path | str, limit: int = 3, *,
                            lambda origin: int(allow_source is None or bool(allow_source(origin))))
         db.create_function("snapshot_url_allowed", 1,
                            lambda url: int(allow_url is None or bool(allow_url(url))))
-        rows = db.execute("""SELECT p.source_id,p.page_key,p.url,p.source_origin,p.title,p.revision,
+        db.create_function("snapshot_timestamp", 1, _snapshot_timestamp, deterministic=True)
+        rows = db.execute(f"""SELECT p.source_id,p.page_key,p.url,p.source_origin,p.title,p.revision,s.file_format,
             p.revision_timestamp,p.namespace,p.namespace_name,p.redirect_target,p.game_build,
             snippet(snapshot_search,3,'[',']',' … ',36) AS excerpt,
             bm25(snapshot_search) AS rank
             FROM snapshot_search JOIN snapshot_pages p
             ON p.source_id=snapshot_search.source_id AND p.page_key=snapshot_search.page_key
+            JOIN snapshot_sources s ON s.source_id=p.source_id
             WHERE snapshot_search MATCH ?
             AND (? IS NULL OR p.source_origin=?)
             AND (? IS NULL OR p.game_build=?)
             AND snapshot_source_allowed(p.source_origin)=1
             AND snapshot_url_allowed(p.url)=1
-            ORDER BY rank,p.source_origin,p.title LIMIT ?""",
+            AND p.rowid=({_CURRENT_PAGE.format(url="p.url")})
+            ORDER BY rank,p.source_origin,p.title,p.url LIMIT ?""",
                          (match, requested_origin, requested_origin, game_build, game_build, limit)).fetchall()
     results = []
     for row in rows:
         item = dict(row)
         item.pop("rank", None)
-        item.update({"status": "snapshot", "live_state": False,
-                     "source_kind": "user_supplied_snapshot", "citation": item["url"],
+        item.update({"status": "snapshot", **_snapshot_provenance(row),
                      "source_links": [item["url"]], "game_build_state":
                          "provided" if item["game_build"] else "unspecified"})
         results.append(item)
@@ -730,9 +819,10 @@ def read_snapshot_page(db_path: Path | str, url: str, offset: int = 0) -> dict:
         db.row_factory = sqlite3.Row
         if not db.execute("SELECT 1 FROM sqlite_master WHERE name='snapshot_pages'").fetchone():
             return {"status": "not_found", "url": normalized}
-        row = db.execute("""SELECT p.* FROM snapshot_pages p JOIN snapshot_sources s
-            ON s.source_id=p.source_id WHERE p.url=?
-            ORDER BY s.imported_at DESC,s.source_id LIMIT 1""", (normalized,)).fetchone()
+        db.create_function("snapshot_timestamp", 1, _snapshot_timestamp, deterministic=True)
+        row = db.execute(f"""SELECT p.*,s.file_format FROM snapshot_pages p
+            JOIN snapshot_sources s ON s.source_id=p.source_id WHERE p.rowid=({_CURRENT_PAGE.format(url='?')})""",
+                         (normalized,)).fetchone()
     if row is None:
         return {"status": "not_found", "url": normalized}
     text = row["body"]
@@ -747,6 +837,6 @@ def read_snapshot_page(db_path: Path | str, url: str, offset: int = 0) -> dict:
         "namespace": row["namespace"], "namespace_name": row["namespace_name"],
         "redirect_target": row["redirect_target"], "game_build": row["game_build"],
         "game_build_state": "provided" if row["game_build"] else "unspecified",
-        "source_kind": "user_supplied_snapshot",
+        "file_format": row["file_format"], **_snapshot_provenance(row),
         "links": json.loads(row["links_json"]), "source_id": row["source_id"],
     }

@@ -174,6 +174,7 @@ def library_status(db_path=None, *, include_star_citizen=True, roots=()):
     full = full_pages(path)
     imports = []
     imported_total = 0
+    historical_articles = 0
     if path.is_file():
         with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as db:
             if db.execute("SELECT 1 FROM sqlite_master WHERE name='snapshot_pages'").fetchone():
@@ -187,6 +188,12 @@ def library_status(db_path=None, *, include_star_citizen=True, roots=()):
                     "SELECT count(distinct url) FROM snapshot_pages "
                     "WHERE enabled(url) AND trim(body, ?) != ''",
                     (SQLITE_WHITESPACE,)).fetchone()[0]
+                if include_star_citizen:
+                    historical_articles = db.execute("""
+                        SELECT count(DISTINCT p.url) FROM snapshot_pages p
+                        JOIN snapshot_sources s USING(source_id)
+                        WHERE s.file_format='starcitizen-archive-20230930'
+                    """).fetchone()[0]
     status = {"star_citizen_enabled": include_star_citizen, "custom_wikis": web_coverage(path, roots),
               "imported_articles": imports}
     for root, info in status["custom_wikis"].items():
@@ -257,6 +264,16 @@ def library_status(db_path=None, *, include_star_citizen=True, roots=()):
             "(see imported_articles by origin); imports can overlap known-URL coverage and are not added "
             "to the preset total. Private notes are excluded from coverage totals."
         )
+        if historical_articles:
+            status["historical_community_edition"] = {
+                "date": "2023-09-30", "articles": historical_articles,
+                "source": "https://archive.org/details/wiki-starcitizen.tools-20230930",
+                "current_revisions_verified": False, "verification_basis": "dated archive",
+            }
+            status["coverage_summary"] += (
+                f" The September 2023 community archive contains {historical_articles:,} saved articles. "
+                "Full-text counts include historical revisions and do not establish current patch coverage."
+            )
     else:
         status["coverage_totals"] = {
             "star_citizen_preset": {"enabled": False},

@@ -87,7 +87,7 @@ class SnapshotTests(unittest.TestCase):
         tmp_path = self.tmp_path
         source = tmp_path / "timestamps.xml"
         source.write_text(_xml(_page("Clock", 1,
-            "<revision><timestamp>2025-01-01T00:00:00Z</timestamp><text>Earlier</text></revision>"
+            "<revision><timestamp>2026-01-01T01:00:00+02:00</timestamp><text>Earlier</text></revision>"
             "<revision><timestamp>2026-01-01T00:00:00Z</timestamp><text>Latest timestamp</text></revision>")),
             encoding="utf-8")
         db = tmp_path / "db.sqlite3"
@@ -143,6 +143,30 @@ class SnapshotTests(unittest.TestCase):
             with self.assertRaises(SnapshotError):
                 import_snapshot(db, source)
         assert search_snapshots("words", db) == []
+
+    def test_historical_edition_attribution_follows_selected_source_on_read_and_search(self):
+        db = self.tmp_path / "wiki.sqlite3"
+        url = "https://starcitizen.tools/Parts_%26_Spares"
+        source = self.tmp_path / "fixture.jsonl"
+        source.write_text(json.dumps({"url": url, "title": "Parts & Spares",
+                                      "text": "Spare component inventory"}), encoding="utf-8")
+        imported = import_snapshot(db, source)
+        for row in (read_snapshot_page(db, url), search_snapshots("spare", db)[0]):
+            self.assertNotIn("archive_url", row)
+            self.assertNotIn("license", row)
+        # Retrieval trusts the edition recorded by the verified archive importer.
+        with closing(sqlite3.connect(db)) as connection, connection:
+            connection.execute("UPDATE snapshot_sources SET file_format=? WHERE source_id=?",
+                               ("starcitizen-archive-20230930", imported["source_id"]))
+        for row in (read_snapshot_page(db, url), search_snapshots("spare", db)[0]):
+            self.assertEqual(row["citation"], url)
+            self.assertEqual(row["publisher"], "Star Citizen Wiki contributors")
+            self.assertEqual(row["edition_date"], "2023-09-30")
+            self.assertEqual(row["archive_url"], "https://archive.org/details/wiki-starcitizen.tools-20230930")
+            self.assertEqual(row["license"], "CC BY-SA 4.0")
+            self.assertEqual(row["license_url"], "https://creativecommons.org/licenses/by-sa/4.0/")
+            self.assertEqual(row["attribution_url"],
+                             "https://starcitizen.tools/index.php?title=Parts_%26_Spares&action=history")
 
     def test_blank_jsonl_text_is_rejected_and_legacy_blank_rows_are_not_coverage(self):
         from wiki_llm.dependencies.wingman_wiki.coverage import full_pages
@@ -226,8 +250,48 @@ class SnapshotTests(unittest.TestCase):
         one = import_snapshot(db, first)
         two = import_snapshot(db, second)
         assert one["source_id"] != two["source_id"]
-        assert len(search_snapshots("shared", db, limit=2)) == 2
+        assert [row["source_id"] for row in search_snapshots("shared", db, limit=2)] == [two["source_id"]]
+        assert read_snapshot_page(db, article["url"])["source_id"] == two["source_id"]
+        with closing(sqlite3.connect(db)) as connection:
+            assert connection.execute("SELECT count(*) FROM snapshot_pages").fetchone()[0] == 2
+            connection.execute("UPDATE snapshot_sources SET imported_at='2026-01-01T00:00:00Z'")
+            connection.commit()
+        tied = min(one["source_id"], two["source_id"])
+        assert search_snapshots("shared", db)[0]["source_id"] == tied
+        assert read_snapshot_page(db, article["url"])["source_id"] == tied
         assert import_snapshot(db, first)["status"] == "unchanged"
+
+    def test_newest_source_revision_wins_before_matching_search_terms(self):
+        db = self.tmp_path / "wiki.sqlite3"
+        root = "https://lore.example.org/game/"
+        # Numeric revision IDs order a publisher's history even with a skewed clock.
+        # Other publishers use opaque IDs or timestamps alone.
+        cases = [
+            ("numbered", {"revision": "0100", "revision_timestamp": "2024-01-01"},
+             {"revision": "9", "revision_timestamp": "2025-01-01"}),
+            ("dated", {"revision": "hash-a", "revision_timestamp": "2025-01-01T00:00:00.0002Z"},
+             {"revision": "hash-z", "revision_timestamp": "2025-01-01T01:00:00.0001+01:00"}),
+            ("unknown", {"revision_timestamp": "2024-01-01"},
+             {"revision": "9", "revision_timestamp": "now"}),
+        ]
+        for name, body in (("current", "currentword"), ("archive", "withdrawnword")):
+            rows = [{"url": root + slug, "title": slug, "text": "commonword " + body,
+                     "game_build": name, **(current if name == "current" else archive)}
+                    for slug, current, archive in cases]
+            source = self.tmp_path / (name + ".jsonl")
+            source.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8")
+            import_snapshot(db, source)
+
+        assert search_snapshots("withdrawnword", db) == []
+        assert search_snapshots("commonword", db, game_build="archive") == []
+        hits = search_snapshots("commonword", db, source_origin="https://lore.example.org",
+                                game_build="current", allow_url=lambda url: url.startswith(root))
+        assert {row["url"] for row in hits} == {root + case[0] for case in cases}
+        for row in hits:
+            page = read_snapshot_page(db, row["url"])
+            assert page["text"] == "commonword currentword"
+            assert page["source_id"] == row["source_id"]
+        assert search_snapshots("commonword", db, allow_url=lambda url: False) == []
 
     def test_snapshot_tables_do_not_touch_existing_wiki_pages_or_user_notes(self):
         tmp_path = self.tmp_path
@@ -312,7 +376,8 @@ class SnapshotTests(unittest.TestCase):
 
         assert [result["file_format"] for result in results] == [
             "mediawiki-xml-gzip", "mediawiki-xml-bzip2", "jsonl-gzip"]
-        assert len(search_snapshots("compressed", db, limit=3)) == 3
+        self.assertCountEqual([entry["title"] for entry in search_snapshots("compressed", db, limit=3)],
+                              ["Compressed", "Gzip Lore"])
         assert search_snapshots("nebula", db)[0]["title"] == "Gzip Lore"
 
     def test_aggregate_import_limits_are_overridable_and_failure_keeps_last_good(self):
