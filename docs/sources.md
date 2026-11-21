@@ -18,7 +18,7 @@ For a wiki that declares the GNU Free Documentation License in its copyright foo
 
 WikiLLM updates while the skill is loaded. Change **Hours between background passes** to set the schedule. The initial download continues in small batches while the publisher allows it. Unchanged pages can return a change indicator without sending their bodies again. Some sites supply whole groups of articles or lack change indicators. Switch **Check online wikis for updates** off for offline use.
 
-For a whole wiki, supply its home URL. For a section, use its directory URL ending in `/`. The crawler respects robots.txt and publisher storage policies. Links, section menus, sitemaps and a compatible MediaWiki page list help it reach nested and unlinked pages. A site may exclude articles or publish only part of its inventory. Ask Wingman for coverage before relying on a specific article offline.
+For a whole wiki, supply its home URL. For a section, use its directory URL ending in `/`. The crawler respects robots.txt and publisher storage policies. Links, section menus, sitemaps and a compatible MediaWiki page list help it reach nested and unlinked pages. If an article list is missing or unreadable, Wingman can still use the pages already saved. Ask which pages are available offline. A full export from the publisher can fill gaps.
 
 ## Import or verify a full edition
 

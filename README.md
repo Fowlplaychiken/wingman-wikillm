@@ -14,7 +14,7 @@ Ask your Wingman about the game while you play. It answers from an offline libra
 
 | Library | What you can read offline |
 | --- | --- |
-| **Star Citizen Wiki** | 3,626 complete articles from September 2023, plus titles and short excerpts from newer pages. The archive predates current patches. [Archive and credits](https://archive.org/details/wiki-starcitizen.tools-20230930) |
+| **Star Citizen Wiki** | 3,626 full articles from September 2023. Current pages add titles and short excerpts under the publisher’s indexing rules. [Archive and credits](https://archive.org/details/wiki-starcitizen.tools-20230930) |
 | **RSI Galactapedia** | English lore articles fetched for personal use through the community API. Answers cite RSI. A publisher placeholder may have no article text yet. [Galactapedia](https://robertsspaceindustries.com/galactapedia) · [API](https://api.star-citizen.wiki/developers) |
 
 Ask **“How much of the Galactapedia do we have on board?”** for actual coverage on your computer. A count of titles includes pages the library has yet to save.
