@@ -69,6 +69,7 @@ _LICENSE = re.compile(r"^https?://(?:www\.)?creativecommons\.org/(?:licenses/(by
 _ALLPAGES = {"action": "query", "format": "json", "list": "allpages", "apnamespace": "0",
              "aplimit": "50", "apfilterredir": "nonredirects"}
 _NAMESPACE_INFO = {"meta": "siteinfo", "siprop": "namespaces"}
+_SITEMAP_ACCEPT = "application/xml, text/xml, application/gzip"
 
 
 def _admin_endpoint(path):
@@ -211,6 +212,17 @@ def _network_url(url):
                 or any(len(fields.get(key, "")) > 1024 for key in ("apcontinue", "continue"))):
             raise ValueError("Unsupported wiki API request") from None
         return base + "?" + urlencode(fields)
+
+
+def _sitemap_url(url):
+    """Validate a declared map, including two common read-only publisher routes."""
+    base, separator, query = url.partition("?")
+    base = _url(base)
+    if separator and (urlsplit(base).path.rsplit("/", 1)[-1], query) not in {
+        ("doku.php", "do=sitemap"), ("index.php", "sitemap=index")
+    }:
+        raise ValueError("Unsupported public sitemap query")
+    return base + separator + query
 
 
 def _api_endpoint(root, edit_uri):
@@ -394,8 +406,11 @@ def _payload(response, limit):
     return body
 
 
-def _transport(url, headers, *, validate_url=_network_url):
+def _transport(url, headers, *, validate_url=None):
     """Pin the TLS connection to a validated public DNS result (no proxy/redirect)."""
+    sitemap = headers.get("Accept") == _SITEMAP_ACCEPT
+    if validate_url is None:
+        validate_url = _sitemap_url if sitemap else _network_url
     parsed = urlsplit(validate_url(url))
     addresses = {item[4][0] for item in socket.getaddrinfo(parsed.hostname, 443, type=socket.SOCK_STREAM)}
     if not addresses or any(not ipaddress.ip_address(value).is_global for value in addresses):
@@ -407,7 +422,7 @@ def _transport(url, headers, *, validate_url=_network_url):
     try:
         connection.request("GET", (parsed.path or "/") + ("?" + parsed.query if parsed.query else ""), headers=headers)
         response = connection.getresponse()
-        limit = corpus.SITEMAP_LIMIT if parsed.path.lower().endswith((".xml", ".xml.gz")) else 4_000_000
+        limit = corpus.SITEMAP_LIMIT if sitemap or parsed.path.lower().endswith((".xml", ".xml.gz")) else 4_000_000
         body = response.read(limit + 1)
         if len(body) > limit:
             raise ValueError("Wiki response exceeds the bounded page size")
@@ -499,17 +514,19 @@ class _Contact:
                     ("https://" + host + "/",))
         return rules
 
-    def follow(self, url, *, rules="", headers=None):
+    def follow(self, url, *, rules="", headers=None, sitemap=False):
         host, seen = urlsplit(url).netloc, set()
         for redirects in range(6):
             seen.add(url)
-            result = self.get(url, rules=rules, headers=headers)
+            request_headers = {"Accept": _SITEMAP_ACCEPT, **(headers or {})} if sitemap else headers
+            result = self.get(url, rules=rules, headers=request_headers)
             if result.status not in (301, 302, 303, 307, 308):
                 break
             location = result.headers.get("location")
             if redirects == 5 or not location:
                 raise ValueError("Public wiki redirect limit or missing target")
-            target = _url(urljoin(url, location))
+            validate = _sitemap_url if sitemap else _url
+            target = validate(urljoin(url, location))
             if (urlsplit(target).netloc != host or target in seen or not _allowed(rules, target)
                     or _admin_endpoint(unquote(urlsplit(target).path))):
                 raise ValueError("Public wiki redirect leaves origin, cycles or is disallowed")
@@ -738,55 +755,90 @@ def _sitemap_stamp(entry, ns):
 def _discover(db, contact, root, rules):
     """Sitemaps are discovery hints. Their absence never removes known pages."""
     from xml.etree import ElementTree
-    sitemap_urls = re.findall(r"^\s*Sitemap:\s*(https://\S+)\s*$", rules, re.I | re.M)
-    if not sitemap_urls:
-        sitemap_urls = [urljoin(root, "/sitemap.xml")]
+    declarations = re.findall(r"^[ \t]*Sitemap:[ \t]*([^#\r\n]*)", rules, re.I | re.M)
+    fallback = urljoin(root, "/sitemap.xml")
     def enqueue(url):
         try:
-            url = _url(url)
+            url = _sitemap_url(url.strip())
         except ValueError:
-            return
-        if (urlsplit(url).netloc == urlsplit(root).netloc and _allowed(rules, url)
-                and re.search(r"\.xml(?:\.gz)?$", urlsplit(url).path, re.I)
-                and not _admin_endpoint(unquote(urlsplit(url).path))):
-            db.execute("INSERT OR IGNORE INTO web_sitemaps(root,url) VALUES(?,?)", (root, url))
+            return None, "unsupported_sitemap_url"
+        if urlsplit(url).netloc != urlsplit(root).netloc:
+            return None, "sitemap_outside_origin"
+        db.execute("INSERT OR IGNORE INTO web_sitemaps(root,url) VALUES(?,?)", (root, url))
+        if not _allowed(rules, url):
+            db.execute("""UPDATE web_sitemaps SET last_error='sitemap_robots_disallowed',
+                checked=NULL,children=NULL,next_attempt=? WHERE root=? AND url=?""",
+                (contact.clock()+86_400, root, url))
+        return url, None
+
+    seeds, problem = [], None
     with db:
-        for url in sitemap_urls:
-            enqueue(url)
-    due = db.execute("""SELECT url,etag,modified FROM web_sitemaps WHERE root=? AND next_attempt<=?
-        ORDER BY next_attempt,url LIMIT 2""", (root, contact.clock())).fetchall()
-    fetched = 0
-    for url, etag, modified in due:
+        for declaration in declarations or [fallback]:
+            if not declarations and not _allowed(rules, fallback):
+                break
+            url, error = enqueue(declaration)
+            if url:
+                seeds.append(url)
+            elif declarations:
+                problem = error
+    # Only a currently declared child can contribute a missing-map error. UNION
+    # also bounds cyclic or overlapping indexes by the number of distinct URLs.
+    active = """WITH RECURSIVE active(url) AS (
+        SELECT value FROM json_each(?) UNION SELECT child.value FROM active
+        JOIN web_sitemaps parent ON parent.root=? AND parent.url=active.url
+        JOIN json_each(parent.children) child) """
+    scope = (json.dumps(seeds), root, root)
+    due = db.execute(active + """SELECT url,etag,modified,children FROM web_sitemaps
+        WHERE root=? AND url IN active AND next_attempt<=? ORDER BY next_attempt,url LIMIT 2""",
+        (*scope, contact.clock())).fetchall()
+    def refresh_map(url, etag, modified, children):
+        if not _allowed(rules, url):
+            with db:
+                db.execute("""UPDATE web_sitemaps SET last_error='sitemap_robots_disallowed',
+                    checked=NULL,children=NULL,next_attempt=? WHERE root=? AND url=?""",
+                    (contact.clock()+86_400, root, url))
+            return 0
         with db:
             db.execute("UPDATE web_sitemaps SET next_attempt=? WHERE root=? AND url=?", (contact.clock()+900, root, url))
-        conditional = _conditional(etag, modified)
-        response = contact.follow(url, rules=rules, headers=conditional)
-        fetched += 1
+        # Older caches have validators but no child inventory. Fetch the map
+        # once before accepting a bodyless 304 for it.
+        conditional = _conditional(etag, modified) if children is not None else {}
+        response = contact.follow(url, rules=rules, headers=conditional, sitemap=True)
         if response.status == 304 and conditional:
             with db:
-                db.execute("""UPDATE web_sitemaps SET checked=?,next_attempt=?,last_error=NULL
+                db.execute("""UPDATE web_sitemaps SET checked=?,next_attempt=?
                     WHERE root=? AND url=?""", (contact.clock(), contact.clock()+86_400, root, url))
-            continue
+            return 1
         if response.status in (404, 410):
             with db:
-                db.execute("""UPDATE web_sitemaps SET next_attempt=?,last_error=NULL,
-                    checked=NULL,etag=NULL,modified=NULL WHERE root=? AND url=?""", (contact.clock()+86_400, root, url))
-            continue
+                error = "declared_sitemap_missing" if declarations or url != fallback else None
+                db.execute("""UPDATE web_sitemaps SET next_attempt=?,last_error=?,
+                    checked=NULL,etag=NULL,modified=NULL,children='[]' WHERE root=? AND url=?""",
+                    (contact.clock()+86_400, error, root, url))
+            return 1
         if response.status != 200:
-            raise ValueError("Incomplete public wiki sitemap")
+            with db:
+                db.execute("""UPDATE web_sitemaps SET last_error=?,etag=NULL,modified=NULL,checked=NULL
+                    WHERE root=? AND url=?""", (f"sitemap_http_{response.status}", root, url))
+            return 1
         body = _payload(response, corpus.SITEMAP_LIMIT)
         if re.search(rb"<!\s*(?:DOCTYPE|ENTITY)", body, re.I):
             raise ValueError("Incomplete public wiki sitemap")
         feed = ElementTree.fromstring(body)
         ns = {"s": "http://www.sitemaps.org/schemas/sitemap/0.9"}
+        child_urls, map_error = [], None
         with db:
-            if feed.tag.endswith("}sitemapindex"):
+            if feed.tag == f"{{{ns['s']}}}sitemapindex":
                 for entry in feed.findall("s:sitemap", ns):
                     location = entry.findtext("s:loc", namespaces=ns)
                     if not location:
                         raise ValueError("Incomplete public wiki sitemap")
-                    enqueue(location)
-            elif feed.tag.endswith("}urlset"):
+                    child, error = enqueue(location)
+                    if child:
+                        child_urls.append(child)
+                    else:
+                        map_error = error
+            elif feed.tag == f"{{{ns['s']}}}urlset":
                 previous = dict(db.execute("""SELECT url,stamp FROM web_sitemap_entries
                     WHERE root=? AND sitemap=?""", (root, url)))
                 entries = {}
@@ -811,10 +863,24 @@ def _discover(db, contact, root, rules):
                     db.execute("UPDATE web_pages SET next_attempt=0 WHERE root=? AND url=?", (root, target))
             else:
                 raise ValueError("Unrecognized public wiki sitemap")
-            db.execute("""UPDATE web_sitemaps SET next_attempt=?,last_error=NULL,checked=?,etag=?,modified=?
-                WHERE root=? AND url=?""", (contact.clock()+86_400, contact.clock(),
-                response.headers.get("etag"), response.headers.get("last-modified"), root, url))
-    return fetched
+            db.execute("""UPDATE web_sitemaps SET next_attempt=?,last_error=?,checked=?,etag=?,modified=?,children=?
+                WHERE root=? AND url=?""", (contact.clock()+86_400, map_error, contact.clock(),
+                response.headers.get("etag"), response.headers.get("last-modified"), json.dumps(child_urls), root, url))
+        return 1
+
+    fetched = 0
+    for row in due:
+        try:
+            fetched += refresh_map(*row)
+        except (_Cancelled, _Cooldown):
+            raise
+        except (ValueError, ElementTree.ParseError, OSError, EOFError, zlib.error, http.client.HTTPException) as exc:
+            with db:
+                db.execute("""UPDATE web_sitemaps SET last_error=?,etag=NULL,modified=NULL,checked=NULL
+                    WHERE root=? AND url=?""", (type(exc).__name__, root, row[0]))
+    pending, issue = db.execute(active + """SELECT count(*) FILTER (WHERE children IS NULL AND last_error IS NULL),
+        min(last_error) FROM web_sitemaps WHERE root=? AND url IN active""", scope).fetchone()
+    return fetched, pending, problem or issue
 
 
 def _purge(db, root, url, status, observed_at=None):
@@ -941,12 +1007,16 @@ def refresh_web_sources(db_path, roots, *, batch_size=5, stop_event=None,
     with closing(sqlite3.connect(path, timeout=2)) as db:
         db.executescript(SCHEMA)
         map_columns = {r[1] for r in db.execute("PRAGMA table_info(web_sitemaps)")}
-        for name, kind in (("etag", "TEXT"), ("modified", "TEXT"), ("checked", "REAL")):
+        for name, kind in (("etag", "TEXT"), ("modified", "TEXT"), ("checked", "REAL"), ("children", "TEXT")):
             if name not in map_columns:
                 db.execute(f"ALTER TABLE web_sitemaps ADD COLUMN {name} {kind}")
         db.commit()
-        if "discovery_retry" not in {r[1] for r in db.execute("PRAGMA table_info(web_roots)")}:
+        root_columns = {r[1] for r in db.execute("PRAGMA table_info(web_roots)")}
+        if "discovery_retry" not in root_columns:
             db.execute("ALTER TABLE web_roots ADD COLUMN discovery_retry REAL NOT NULL DEFAULT 0")
+            db.commit()
+        if "sitemaps_pending" not in root_columns:
+            db.execute("ALTER TABLE web_roots ADD COLUMN sitemaps_pending INTEGER")
             db.commit()
         page_columns = {r[1] for r in db.execute("PRAGMA table_info(web_pages)")}
         if "license_url" not in page_columns:
@@ -1013,10 +1083,15 @@ def refresh_web_sources(db_path, roots, *, batch_size=5, stop_event=None,
                 row = db.execute("SELECT last_discovery,discovery_retry FROM web_roots WHERE root=?", (root,)).fetchone()
                 if _clock() >= row[1]:
                     try:
-                        fetched = _discover(db, contact, root, rules)
+                        fetched, pending, discovery_error = _discover(db, contact, root, rules)
                         with db:
-                            if fetched:
-                                db.execute("UPDATE web_roots SET last_discovery=?,discovery_retry=0,last_error=NULL WHERE root=?", (_clock(), root))
+                            db.execute("""UPDATE web_roots SET last_discovery=coalesce(?,last_discovery),
+                                sitemaps_pending=?,discovery_retry=0,last_error=? WHERE root=?""",
+                                (_clock() if fetched else None, pending, discovery_error, root))
+                        report["roots"][root]["sitemaps_pending"] = pending
+                        if discovery_error:
+                            report["roots"][root]["discovery_error"] = discovery_error
+                            report["failed"] += 1
                     except (_Cancelled, _Cooldown):
                         raise
                     except Exception as exc:
@@ -1220,6 +1295,9 @@ def refresh_web_sources(db_path, roots, *, batch_size=5, stop_event=None,
                     report["failed"] += not isinstance(exc, _Cooldown)
             if not progressed:
                 break
+    for item in report["roots"].values():
+        if (item.get("discovery_error") or item.get("sitemaps_pending")) and item["state"] == "ready":
+            item["state"] = "partial"
     report["coverage"] = web_coverage(db_path, roots)
     return report
 
@@ -1314,6 +1392,9 @@ def web_coverage(db_path, roots):
             if row["status"] == "indexed":
                 item["indexed_storage_modes"][row["storage_mode"]] = row["pages"]
     for row in _read(db_path, """SELECT root,last_discovery,last_success,last_error FROM web_roots
+            WHERE root IN (SELECT value FROM json_each(?))""", (encoded,)):
+        result[row.pop("root")].update(row)
+    for row in _read(db_path, """SELECT root,sitemaps_pending FROM web_roots
             WHERE root IN (SELECT value FROM json_each(?))""", (encoded,)):
         result[row.pop("root")].update(row)
     for root in roots:
