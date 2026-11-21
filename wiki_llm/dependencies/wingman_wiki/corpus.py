@@ -35,6 +35,8 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS wiki_urls(url TEXT PRIMARY KEY, lastmod TEXT,
     pageid INTEGER, checked_at TEXT, status TEXT NOT NULL DEFAULT 'pending');
 CREATE TABLE IF NOT EXISTS catalog_titles(url TEXT PRIMARY KEY, title TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS source_changes(url TEXT PRIMARY KEY,
+    observed_at TEXT NOT NULL, reason TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS pages(pageid INTEGER PRIMARY KEY, title TEXT, revision INTEGER,
     timestamp TEXT, wikitext TEXT, extract TEXT);
 CREATE TABLE IF NOT EXISTS page_sources(pageid INTEGER PRIMARY KEY, url TEXT UNIQUE NOT NULL,
@@ -221,7 +223,9 @@ class Publisher:
             page = response.get("data", {}).get("allArticle")
             if not isinstance(page, dict) or type(page.get("totalCount")) is not int:
                 raise ValueError("Galactapedia returned no catalog metadata")
-            total = page["totalCount"] if total is None else total
+            if total is not None and total != page["totalCount"]:
+                raise ValueError("Galactapedia catalog changed during pagination")
+            total = page["totalCount"]
             for edge in page.get("edges", []):
                 node = edge.get("node", {})
                 ident, slug, title = node.get("id", ""), node.get("slug", ""), node.get("title")
@@ -339,13 +343,21 @@ def sitemap_entries(source: Publisher, url: str, seen: set[str]):
     feed = ElementTree.fromstring(raw)
     ns = {"s": "http://www.sitemaps.org/schemas/sitemap/0.9"}
     if feed.tag.endswith("}sitemapindex"):
-        for child in feed.findall("s:sitemap/s:loc", ns):
-            if child.text and child.text.endswith(".xml") and "/spectrum/" not in child.text:
-                yield from sitemap_entries(source, child.text, seen)
+        for child in feed.findall("s:sitemap", ns):
+            location = child.findtext("s:loc", namespaces=ns)
+            if location and "/spectrum/" in location:
+                continue
+            if not location or not location.endswith(".xml"):
+                raise ValueError("unsupported or incomplete child sitemap")
+            yield from sitemap_entries(source, location, seen)
     elif feed.tag.endswith("}urlset"):
         for row in feed.findall("s:url", ns):
             loc = row.findtext("s:loc", namespaces=ns)
-            if loc and indexable(loc) and source.allowed(loc):
+            if not loc:
+                raise ValueError("sitemap entry has no source URL")
+            if indexable(loc):
+                if not source.allowed(loc):
+                    raise PermissionError("publisher robots excludes part of the catalog")
                 yield loc, row.findtext("s:lastmod", namespaces=ns)
     else:
         raise ValueError(f"unrecognized sitemap: {url}")
@@ -410,43 +422,70 @@ class Article(HTMLParser):
             self.paragraph.append(data)
 
 
+def catalog_owner(url: str) -> str:
+    if url.startswith(COMMUNITY + "/"):
+        return "community"
+    if url.startswith(SUPPORT + "/"):
+        return "support"
+    if url.startswith(GALACTAPEDIA + "/article/"):
+        return "galactapedia"
+    return "official"
+
+
+def record_source_change(db, url, observed_at, reason):
+    # Observation time is local evidence, never a fabricated publisher lastmod.
+    db.execute("""INSERT INTO source_changes VALUES(?,?,?)
+        ON CONFLICT(url) DO UPDATE SET observed_at=excluded.observed_at,reason=excluded.reason""",
+        (url, observed_at, reason))
+
+
+def apply_catalog(db, name, records, observed_at):
+    """Apply one completely collected publisher snapshot inside a transaction."""
+    if not records:
+        raise ValueError("empty catalog cannot replace last good catalog")
+    existing = {url: (modified, pageid, status, title) for url, modified, pageid, status, title in
+        db.execute("""SELECT u.url,u.lastmod,u.pageid,u.status,t.title FROM wiki_urls u
+            LEFT JOIN catalog_titles t ON t.url=u.url""") if catalog_owner(url) == name}
+    has_page_queue = name == "community" and db.execute(
+        "SELECT 1 FROM sqlite_master WHERE name='refresh_pages'").fetchone()
+    for url in existing.keys() - records.keys():
+        if existing[url][2] != "removed":
+            record_source_change(db, url, observed_at, "catalog_url_removed")
+        db.execute("UPDATE wiki_urls SET status='removed' WHERE url=?", (url,))
+    for url, value in records.items():
+        old = existing.get(url)
+        modified = None if name == "galactapedia" else value
+        if old:
+            if old[2] == "removed":
+                record_source_change(db, url, observed_at, "catalog_url_restored")
+            elif name == "galactapedia" and old[3] is not None and old[3] != value:
+                record_source_change(db, url, observed_at, "catalog_title_changed")
+            elif old[0] != modified:
+                record_source_change(db, url, observed_at, "publisher_metadata_changed")
+        status = "indexed" if old and old[1] is not None else ("pending" if name == "community" else "catalog")
+        db.execute("""INSERT INTO wiki_urls(url,lastmod,status) VALUES(?,?,?)
+            ON CONFLICT(url) DO UPDATE SET lastmod=excluded.lastmod,status=excluded.status""", (url, modified, status))
+        if name == "galactapedia":
+            db.execute("INSERT OR REPLACE INTO catalog_titles VALUES(?,?)", (url, value))
+        if name == "community" and (old is None or old[0] != modified or old[2] == "removed"):
+            # Do not require refresh.py's auxiliary schema for the standalone CLI.
+            if has_page_queue:
+                db.execute("""INSERT INTO refresh_pages(url,next_attempt) VALUES(?,0)
+                    ON CONFLICT(url) DO UPDATE SET next_attempt=0""", (url,))
+    rebuild_catalog(db)
+
+
 def discover(db: sqlite3.Connection, publisher: Publisher) -> int:
     discovered: dict[str, str | None] = {}
     for sitemap in SITEMAPS:
         discovered.update(sitemap_entries(publisher, sitemap, set()))
     lore = dict(publisher.galactapedia())
     with db:
-        db.execute("CREATE TEMP TABLE IF NOT EXISTS imported_sitemap(url TEXT PRIMARY KEY)")
-        db.execute("DELETE FROM imported_sitemap")
-        db.executemany("INSERT INTO imported_sitemap VALUES (?)", ((url,) for url in discovered))
-        db.execute(
-            """UPDATE wiki_urls SET status='removed'
-            WHERE url NOT IN (SELECT url FROM imported_sitemap)
-            AND lastmod IS NOT NULL AND url NOT LIKE ?""",
-            (GALACTAPEDIA + "/article/%",),
-        )
-        db.executemany(
-            """INSERT INTO wiki_urls(url,lastmod,status) VALUES (?,?,?)
-            ON CONFLICT(url) DO UPDATE SET lastmod=excluded.lastmod,
-              status=CASE WHEN excluded.status='catalog'
-                               OR excluded.lastmod IS NOT wiki_urls.lastmod
-                               OR wiki_urls.status='removed'
-                          THEN excluded.status ELSE wiki_urls.status END""",
-            (
-                (url, modified, "pending" if url.startswith(COMMUNITY + "/") else "catalog")
-                for url, modified in sorted(discovered.items())
-            ),
-        )
-        db.execute(
-            "UPDATE wiki_urls SET status='removed' WHERE url LIKE ?", (GALACTAPEDIA + "/article/%",)
-        )
-        db.executemany(
-            """INSERT INTO wiki_urls(url,status) VALUES (?,'catalog')
-            ON CONFLICT(url) DO UPDATE SET status='catalog'""",
-            ((url,) for url in lore),
-        )
-        db.executemany("INSERT OR REPLACE INTO catalog_titles VALUES(?,?)", lore.items())
-        rebuild_catalog(db)
+        observed_at = datetime.now(UTC).isoformat(timespec="microseconds")
+        for name in ("community", "support", "official"):
+            apply_catalog(db, name, {url: value for url, value in discovered.items()
+                                    if catalog_owner(url) == name}, observed_at)
+        apply_catalog(db, "galactapedia", lore, observed_at)
     discovered.update(lore)
     return len(discovered)
 
@@ -534,7 +573,8 @@ def publish_note(root: Path, file: Path) -> Path:
 
 
 def crawl(
-    db: sqlite3.Connection, publisher: Publisher, limit: int, urls: list[str], query: str = ""
+    db: sqlite3.Connection, publisher: Publisher, limit: int, urls: list[str], query: str = "",
+    *, observed_at: str | None = None,
 ) -> int:
     if query:
         terms = re.findall(r"[^\W_]+", query)
@@ -570,20 +610,23 @@ def crawl(
                 "RSI references are title-and-link entries. "
                 "Use the cited source or a reviewed local note."
             )
-        checked = datetime.now(UTC).isoformat(timespec="seconds")
+        checked = observed_at or datetime.now(UTC).isoformat(timespec="microseconds")
         try:
             article = Article(publisher.get(url))
         except HTTPError as exc:
             if exc.code not in {404, 410}:
                 raise ValueError(f"HTTP {exc.code} at {url}") from exc
             with db:
+                prior = db.execute("SELECT status FROM wiki_urls WHERE url=?", (url,)).fetchone()
+                if prior and prior[0] != "removed":
+                    record_source_change(db, url, checked, "page_removed")
                 db.execute(
                     "DELETE FROM pages WHERE pageid=(SELECT pageid FROM page_sources WHERE url=?)",
                     (url,),
                 )
                 db.execute("DELETE FROM page_sources WHERE url=?", (url,))
                 db.execute(
-                    "UPDATE wiki_urls SET status='removed',checked_at=? WHERE url=?", (checked, url)
+                    "UPDATE wiki_urls SET status='removed',checked_at=?,pageid=NULL WHERE url=?", (checked, url)
                 )
                 db.execute("DELETE FROM catalog_search WHERE url=?", (url,))
             continue
@@ -594,9 +637,20 @@ def crawl(
         title = article.title or wiki_title(url)
         origin = publisher_name(url)
         with db:
-            row = db.execute("SELECT pageid FROM page_sources WHERE url=?", (url,)).fetchone()
+            row = db.execute("""SELECT p.pageid,p.title,p.revision,p.timestamp,p.extract
+                FROM page_sources s JOIN pages p ON p.pageid=s.pageid WHERE s.url=?""", (url,)).fetchone()
             if row:
                 pageid = row[0]
+                # Even an unchanged title/sitemap can contain a new MediaWiki
+                # revision. Record the observed signal without editing notes.
+                reason = next((label for before, after, label in (
+                    (row[2], revision, "page_revision_changed"),
+                    (row[1], title, "page_title_changed"),
+                    (row[3], stamp, "page_metadata_changed"),
+                    (row[4], article.excerpt, "page_excerpt_changed"),
+                ) if before != after), None)
+                if reason:
+                    record_source_change(db, url, checked, reason)
                 db.execute(
                     "UPDATE pages SET title=?,revision=?,timestamp=?,extract=? WHERE pageid=?",
                     (title, revision, stamp, article.excerpt, pageid),

@@ -1,4 +1,5 @@
 import os
+import re
 import shutil
 import tempfile
 import unittest
@@ -32,9 +33,11 @@ class DistributionPrivacyTests(unittest.TestCase):
             with patch.object(build, "ROOT", root), patch.object(build, "PACKAGE", package), patch.dict(
                     os.environ, {"SC_WIKI_DB": str(db)}):
                 archive = build.build(root / "dist")
+            version = re.search(r"^version: ([0-9.]+)$", (package / "default_config.yaml").read_text(), re.M)[1]
+            namespace = "wingman_wiki_v" + version.replace(".", "_")
             with zipfile.ZipFile(archive) as bundle:
                 self.assertEqual(set(bundle.namelist()), {
-                    "wiki_llm/" + name.replace("dependencies/wingman_wiki/", "dependencies/wingman_wiki_v0_1_2/")
+                    "wiki_llm/" + name.replace("dependencies/wingman_wiki/", f"dependencies/{namespace}/")
                     for name in (*build.FILES, *build.BINARY_FILES, "LICENSE", "README.md")})
                 self.assertFalse(any(marker.encode() in bundle.read(k) for k in bundle.namelist()))
 

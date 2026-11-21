@@ -8,7 +8,9 @@ from __future__ import annotations
 import argparse
 from contextlib import closing
 from dataclasses import asdict, dataclass, field
+from datetime import UTC, datetime
 import json
+import os
 from pathlib import Path
 import sqlite3
 import threading
@@ -30,6 +32,20 @@ CREATE TABLE IF NOT EXISTS refresh_queue(id INTEGER PRIMARY KEY CHECK(id=1),pref
 CATALOGS = ("community", "support", "official", "galactapedia")
 
 
+def _enabled_catalogs(values):
+    if values is None:
+        return CATALOGS
+    if isinstance(values, (str, bytes)):
+        raise ValueError("enabled_catalogs must be an iterable of catalog names")
+    try:
+        selected = tuple(values)
+    except TypeError as exc:
+        raise ValueError("enabled_catalogs must be an iterable of catalog names") from exc
+    if any(type(name) is not str or name not in CATALOGS for name in selected):
+        raise ValueError("unknown enabled catalog")
+    return tuple(name for name in CATALOGS if name in selected)
+
+
 @dataclass
 class RefreshReport:
     catalogs: dict[str, dict] = field(default_factory=dict)
@@ -39,16 +55,19 @@ class RefreshReport:
     leased_elsewhere: bool = False
     coverage: dict[str, dict] = field(default_factory=dict)
     deferred: int = 0
+    sources: dict = field(default_factory=dict)
+
+    def building_library(self):
+        community = self.coverage.get("community", {})
+        if self.indexed and community.get("catalog_urls", 0) > community.get("indexed_pages", 0):
+            return True
+        wikis = self.sources.get("wikis", {})
+        return bool(wikis.get("indexed") and any(
+            source.get("pages", {}).get("pending") for source in wikis.get("coverage", {}).values()))
 
 
 def _owner(url):
-    if url.startswith(corpus.COMMUNITY + "/"):
-        return "community"
-    if url.startswith(corpus.SUPPORT + "/"):
-        return "support"
-    if url.startswith(corpus.GALACTAPEDIA + "/article/"):
-        return "galactapedia"
-    return "official"
+    return corpus.catalog_owner(url)
 
 
 def _cancelled(stop_event):
@@ -72,32 +91,16 @@ def _catalog(publisher, name, stop_event):
     return records
 
 
-def _apply_catalog(db, name, records):
+def _apply_catalog(db, name, records, observed_at):
     # Publish one complete source atomically. Other sources and last-good pages
     # survive partial discovery, robots failures, and malformed feeds.
-    existing = {url: (modified, pageid, status) for url, modified, pageid, status in
-                db.execute("SELECT url,lastmod,pageid,status FROM wiki_urls") if _owner(url) == name}
-    for url in existing.keys() - records.keys():
-        db.execute("UPDATE wiki_urls SET status='removed' WHERE url=?", (url,))
-    for url, value in records.items():
-        old = existing.get(url)
-        modified = None if name == "galactapedia" else value
-        # Changed source metadata queues verification without hiding old content.
-        status = "indexed" if old and old[1] is not None else ("pending" if name == "community" else "catalog")
-        db.execute("""INSERT INTO wiki_urls(url,lastmod,status) VALUES(?,?,?)
-            ON CONFLICT(url) DO UPDATE SET lastmod=excluded.lastmod,status=excluded.status""", (url, modified, status))
-        if name == "galactapedia":
-            db.execute("INSERT OR REPLACE INTO catalog_titles VALUES(?,?)", (url, value))
-        if name == "community" and (old is None or old[0] != modified or old[2] == "removed"):
-            db.execute("""INSERT INTO refresh_pages(url,next_attempt) VALUES(?,0)
-                ON CONFLICT(url) DO UPDATE SET next_attempt=0""", (url,))
-    corpus.rebuild_catalog(db)
+    corpus.apply_catalog(db, name, records, observed_at)
 
 
 def _refresh_once(db_path: str | Path, *, batch_size: int = 5,
                  catalog_interval: float = 86_400, page_interval: float = 604_800,
                  publisher=None, stop_event: threading.Event | None = None,
-                 clock=time.time) -> RefreshReport:
+                 clock=time.time, enabled_catalogs=None) -> RefreshReport:
     """Refresh due catalogs independently, then a bounded community-page batch.
 
     Failure backoff is at least five minutes; successful verification is paced
@@ -108,6 +111,7 @@ def _refresh_once(db_path: str | Path, *, batch_size: int = 5,
     if not all(type(x) in (int, float) and 60 <= x <= 31_536_000
                for x in (catalog_interval, page_interval)):
         raise ValueError("refresh intervals must be 60 seconds..1 year")
+    enabled = _enabled_catalogs(enabled_catalogs)
     path = Path(db_path).expanduser()
     path.parent.mkdir(parents=True, exist_ok=True)
     source = publisher if publisher is not None else corpus.Publisher(stop_event)
@@ -140,6 +144,9 @@ def _refresh_once(db_path: str | Path, *, batch_size: int = 5,
         try:
             for name in CATALOGS:
                 _cancelled(stop_event)
+                if name not in enabled:
+                    report.catalogs[name] = {"state": "disabled"}
+                    continue
                 now = clock()
                 state = db.execute("SELECT last_attempt,last_success,last_error FROM refresh_catalogs WHERE name=?", (name,)).fetchone()
                 delay = min(catalog_interval, 900) if state and state[2] else catalog_interval
@@ -150,7 +157,7 @@ def _refresh_once(db_path: str | Path, *, batch_size: int = 5,
                     records = _catalog(source, name, stop_event)
                     _cancelled(stop_event)
                     with db:
-                        _apply_catalog(db, name, records)
+                        _apply_catalog(db, name, records, datetime.fromtimestamp(now, UTC).isoformat(timespec="microseconds"))
                         db.execute("""INSERT INTO refresh_catalogs VALUES(?,?,?,NULL)
                             ON CONFLICT(name) DO UPDATE SET last_attempt=excluded.last_attempt,
                             last_success=excluded.last_success,last_error=NULL""", (name, now, now))
@@ -167,8 +174,8 @@ def _refresh_once(db_path: str | Path, *, batch_size: int = 5,
             # Alternate revalidation/retries and discovery, including across
             # one-item batches/processes. A large never-read catalog cannot starve
             # due content; conversely overdue content cannot consume every slot.
-            queues = {}
-            for existing in (0, 1):
+            queues = {0: [], 1: []}
+            for existing in ((0, 1) if "community" in enabled else ()):
                 queues[existing] = list(db.execute("""SELECT u.url FROM wiki_urls u
                     LEFT JOIN refresh_pages r ON r.url=u.url
                     WHERE u.status!='removed' AND u.url LIKE 'https://starcitizen.tools/%'
@@ -184,8 +191,9 @@ def _refresh_once(db_path: str | Path, *, batch_size: int = 5,
                     break
                 targets.append(queues[group].pop(0))
                 prefer = 1-group
-            with db:
-                db.execute("INSERT OR REPLACE INTO refresh_queue VALUES(1,?)", (prefer,))
+            if targets:
+                with db:
+                    db.execute("INSERT OR REPLACE INTO refresh_queue VALUES(1,?)", (prefer,))
             blocked = dict(getattr(source, "blocked_until", {}))
             for (url,) in targets:
                 _cancelled(stop_event)
@@ -195,7 +203,8 @@ def _refresh_once(db_path: str | Path, *, batch_size: int = 5,
                     report.deferred += 1
                     continue
                 try:
-                    count = corpus.crawl(db, source, 1, [url])
+                    count = corpus.crawl(db, source, 1, [url],
+                        observed_at=datetime.fromtimestamp(now, UTC).isoformat(timespec="microseconds"))
                     with db:
                         db.execute("""INSERT INTO refresh_pages VALUES(?,?,?,?,NULL)
                             ON CONFLICT(url) DO UPDATE SET last_attempt=excluded.last_attempt,
@@ -247,10 +256,23 @@ class _Cancellation:
         return True
 
 
+def snapshot_limits():
+    """Optional per-install limits for a trusted large export, in bytes or pages."""
+    limits = {}
+    for option in ("max_compressed_bytes", "max_expanded_bytes", "max_pages"):
+        value = os.environ.get("WIKILLM_SNAPSHOT_" + option.upper())
+        if value is None:
+            continue
+        if not value.isdecimal():
+            raise ValueError(f"Use a nonnegative integer for snapshot {option}.")
+        limits[option] = int(value) or None
+    return limits
+
+
 def refresh_once(db_path: str | Path, *, batch_size: int = 5,
                  catalog_interval: float = 86_400, page_interval: float = 604_800,
                  publisher=None, stop_event: threading.Event | None = None,
-                 clock=time.time) -> RefreshReport:
+                 clock=time.time, enabled_catalogs=None, roots=(), import_snapshots=False) -> RefreshReport:
     """One leased refresh for a per-user DB; stale lease recovers after 120 s.
 
     A small heartbeat renews during bounded network reads. Losing the lease
@@ -258,6 +280,7 @@ def refresh_once(db_path: str | Path, *, batch_size: int = 5,
     """
     if stop_event is not None and stop_event.is_set():
         return RefreshReport(cancelled=True)
+    enabled = _enabled_catalogs(enabled_catalogs)
     path = Path(db_path).expanduser()
     path.parent.mkdir(parents=True, exist_ok=True)
     token = uuid.uuid4().hex
@@ -290,8 +313,26 @@ def refresh_once(db_path: str | Path, *, batch_size: int = 5,
     try:
         if isinstance(publisher, corpus.Publisher):
             publisher.stop_event = cancellation
-        return _refresh_once(path, batch_size=batch_size, catalog_interval=catalog_interval,
-            page_interval=page_interval, publisher=publisher, stop_event=cancellation, clock=clock)
+        report = _refresh_once(path, batch_size=batch_size, catalog_interval=catalog_interval,
+            page_interval=page_interval, publisher=publisher, stop_event=cancellation, clock=clock,
+            enabled_catalogs=enabled)
+        if roots and not cancellation.is_set():
+            from .web_sources import refresh_web_sources
+            try:
+                report.sources["wikis"] = refresh_web_sources(path, roots, batch_size=batch_size, stop_event=cancellation)
+            except Exception as exc:
+                report.sources["wikis"] = {"status": "failed", "error_type": type(exc).__name__}
+                report.failed += 1
+        if import_snapshots and not cancellation.is_set():
+            from .snapshots import sync_snapshots
+            try:
+                report.sources["imports"] = sync_snapshots(path, **snapshot_limits())
+                report.failed += sum(row.get("status") == "error" for row in report.sources["imports"]["sources"])
+            except (OSError, ValueError, sqlite3.Error) as exc:
+                report.sources["imports"] = {"status": "failed", "error_type": type(exc).__name__}
+                report.failed += 1
+        report.cancelled = report.cancelled or cancellation.is_set()
+        return report
     finally:
         finished.set()
         pulse.join(3)
@@ -305,12 +346,13 @@ class RefreshScheduler:
     stop() interrupts pacing immediately. An active HTTP request may take its
     existing 15 second timeout; False means the worker has not stopped yet.
     """
-    def __init__(self, db_path, *, interval=3600, **refresh_options):
+    def __init__(self, db_path, *, interval=3600, catch_up=False, **refresh_options):
         if type(interval) not in (int, float) or not 60 <= interval <= 31_536_000:
             raise ValueError("scheduler interval must be 60 seconds..1 year")
         if "stop_event" in refresh_options:
             raise ValueError("scheduler owns its cancellation event")
         self.db_path, self.interval, self.options = db_path, interval, refresh_options
+        self.catch_up = catch_up
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._thread = None
@@ -327,13 +369,22 @@ class RefreshScheduler:
         return self
 
     def _work(self):
+        next_import = 0.0
         while not self._stop.is_set():
+            delay = self.interval
             try:
-                self.last_report = refresh_once(self.db_path, stop_event=self._stop, **self.options)
+                options = self.options.copy()
+                if options.get("import_snapshots"):
+                    options["import_snapshots"] = time.monotonic() >= next_import
+                self.last_report = refresh_once(self.db_path, stop_event=self._stop, **options)
+                if "imports" in self.last_report.sources:
+                    next_import = time.monotonic() + self.interval
+                if self.catch_up and self.last_report.building_library():
+                    delay = min(delay, 120)
                 self.last_error = None
             except Exception as exc:
                 self.last_error = type(exc).__name__
-            if self._stop.wait(self.interval):
+            if self._stop.wait(delay):
                 break
 
     def stop(self, timeout=0):

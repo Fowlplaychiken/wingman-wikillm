@@ -1,14 +1,21 @@
-"""Read the same local wiki from a shell, RAG client or another assistant."""
+"""Read and maintain the same offline game library from another assistant."""
 import argparse
+from dataclasses import asdict
 import json
 from pathlib import Path
 
-from .dependencies.wingman_wiki.library import lookup, note_history
+from .dependencies.wingman_wiki.library import check_inventory, library_status, lookup, note_history, read_page
+from .dependencies.wingman_wiki.reference import community_db_path
+from .dependencies.wingman_wiki.refresh import refresh_once, snapshot_limits
+from .dependencies.wingman_wiki.snapshots import import_snapshot
+from .dependencies.wingman_wiki.web_sources import parse_roots
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", type=Path, help="Use another local wiki database")
+    parser.add_argument("--wiki", action="append", default=[], help="Enable a wiki home URL (repeatable)")
+    parser.add_argument("--no-sc", action="store_true", help="Turn off the Star Citizen preset for this command")
     commands = parser.add_subparsers(dest="command", required=True)
     search = commands.add_parser("lookup", help="Find cited local evidence")
     search.add_argument("query")
@@ -16,10 +23,41 @@ def main():
     history = commands.add_parser("history", help="Read revisions of one local note")
     history.add_argument("topic")
     history.add_argument("--before", type=int)
+    article = commands.add_parser("read", help="Read a saved page without connecting")
+    article.add_argument("url")
+    article.add_argument("--offset", type=int, default=0)
+    commands.add_parser("status", help="Show local coverage of enabled sources")
+    refresh = commands.add_parser("refresh", help="Update enabled sources once")
+    refresh.add_argument("--batch-size", type=int, default=5)
+    snapshot = commands.add_parser("import", help="Import a local MediaWiki XML or article JSONL export")
+    snapshot.add_argument("path", type=Path)
+    inventory = commands.add_parser("verify", help="Compare saved article text against a publisher URL/revision inventory")
+    inventory.add_argument("manifest", type=Path)
     args = parser.parse_args()
-    result = (lookup(Path(__file__).with_name("guides"), args.query, args.build, args.db)
-              if args.command == "lookup" else note_history(args.topic, args.db, args.before))
+    db = community_db_path(args.db)
+    try:
+        roots = parse_roots("\n".join(args.wiki))
+        options = {"include_star_citizen": not args.no_sc, "roots": roots}
+        if args.command == "lookup":
+            result = lookup(Path(__file__).with_name("guides"), args.query, args.build, db, **options)
+        elif args.command == "history":
+            result = note_history(args.topic, db, args.before)
+        elif args.command == "read":
+            result = read_page(db, args.url, offset=args.offset, **options)
+        elif args.command == "status":
+            result = library_status(db, **options)
+        elif args.command == "verify":
+            result = check_inventory(db, args.manifest, **options)
+        elif args.command == "import":
+            result = import_snapshot(db, args.path, **snapshot_limits())
+        else:
+            result = asdict(refresh_once(db, batch_size=args.batch_size, enabled_catalogs=() if args.no_sc else None,
+                                         roots=roots, import_snapshots=True))
+    except (OSError, ValueError) as exc:
+        parser.error(str(exc))
     print(json.dumps(result, ensure_ascii=True))
+    if args.command == "verify" and result["status"] == "incomplete":
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

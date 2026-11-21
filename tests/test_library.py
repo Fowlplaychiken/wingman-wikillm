@@ -1,3 +1,5 @@
+from contextlib import closing
+import json
 import socket
 import sqlite3
 import tempfile
@@ -5,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from wiki_llm.dependencies.wingman_wiki.library import lookup, note_history, record_note
+from wiki_llm.dependencies.wingman_wiki.library import check_inventory, library_status, lookup, note_history, read_page, record_note
 
 GUIDES = Path(__file__).resolve().parents[1] / "wiki_llm" / "guides"
 
@@ -69,3 +71,59 @@ class OfflineLibraryTests(unittest.TestCase):
         found = lookup(GUIDES, "Aberdeen visibility", db_path=self.db)["references"][0]
         self.assertTrue(found["needs_review"])
         self.assertEqual(found["changed_sources"][0]["lastmod"], "2026-11-21")
+
+    def test_other_game_search_read_and_status_offline_with_preset_disabled(self):
+        from wiki_llm.dependencies.wingman_wiki.snapshots import import_snapshot
+        base = "https://wiki.example.org/other/"
+        url = base + "Engine"
+        export = self.db.parent / "game.jsonl"
+        pages = [{"url": url, "title": "Steam engines", "text": "Coal powers the locomotive.", "game_build": "1.0"},
+                 {"url": "https://wiki.example.org/hidden/Engine", "title": "Locomotive", "text": "Hidden locomotive"}]
+        export.write_text("\n".join(json.dumps(row) for row in pages), encoding="utf-8")
+        import_snapshot(self.db, export)
+        options = {"include_star_citizen": False, "roots": (base,)}
+        with patch.object(socket, "socket", side_effect=AssertionError("network access")):
+            self.assertFalse(lookup(GUIDES, "Aberdeen", db_path=self.db, **options)["references"])
+            hit = lookup(GUIDES, "What powers a locomotive?", "1.0", self.db, **options)["references"]
+            self.assertEqual([r["citation"] for r in hit], [url])
+            self.assertIn("Coal", read_page(self.db, url, **options)["text"])
+            self.assertEqual(read_page(self.db, pages[1]["url"], **options)["status"], "unavailable")
+            self.assertEqual(library_status(self.db, **options)["imported_articles"][0]["saved_articles"], 1)
+            self.assertFalse(lookup(GUIDES, "locomotive", db_path=self.db, roots=())["references"])
+            self.assertTrue(lookup(GUIDES, "Aberdeen", db_path=self.db, roots=(base,))["references"])
+            record_note("my-railway", "My railway", "I named my locomotive Grebe.", status="reviewed", db_path=self.db)
+            self.assertTrue(lookup(GUIDES, "Grebe", db_path=self.db, include_star_citizen=False)["references"])
+
+    def test_new_evidence_marks_note_until_reviewed_again_on_same_day(self):
+        url = "https://wiki.example.org/rail/Engine"
+        result = record_note("engine", "Steam engine", "Coal", status="reviewed", source=url, db_path=self.db)
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute("CREATE TABLE source_changes(url PRIMARY KEY,observed_at TEXT,reason TEXT)")
+            stamp = note_history("engine", self.db)[0]["recorded_at"]
+            from datetime import datetime, timedelta
+            when = (datetime.fromisoformat(stamp) + timedelta(microseconds=1)).isoformat()
+            conn.execute("INSERT INTO source_changes VALUES(?,?,?)", (url, when, "web_page_changed"))
+        self.assertTrue(lookup(GUIDES, "Steam", db_path=self.db)["references"][0]["needs_review"])
+        record_note("engine", "Steam engine", "Updated coal evidence", status="reviewed", source=url,
+                    previous_revision=result["revision"], db_path=self.db)
+        self.assertFalse(lookup(GUIDES, "Steam", db_path=self.db)["references"][0].get("needs_review", False))
+
+    def test_prove_article_text_against_independent_inventory_and_revision(self):
+        from wiki_llm.dependencies.wingman_wiki.snapshots import import_snapshot
+        base = "https://atlas.example.org/game/"
+        manifest, export = (self.db.parent / name for name in ("inventory.jsonl", "articles.jsonl"))
+        def write(path, rows):
+            path.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8")
+        expected = [{"url": base+"Orphan", "revision": 4}, {"url": base+"Main", "revision": "b"}]
+        write(manifest, expected)
+        articles = [dict(item, title="Map", text="Complete location record.") for item in expected]
+        write(export, [dict(articles[0], revision=3)])
+        import_snapshot(self.db, export)
+        opts = {"include_star_citizen": False, "roots": (base,)}
+        partial = check_inventory(self.db, manifest, **opts)
+        self.assertEqual((partial["missing_text"], partial["revision_unverified"]), (1, 1))
+        write(export, articles)
+        import_snapshot(self.db, export)
+        with patch.object(socket, "socket", side_effect=AssertionError("network access")):
+            self.assertEqual(check_inventory(self.db, manifest, **opts)["status"], "matches_inventory")
+            self.assertEqual(check_inventory(self.db, manifest, include_star_citizen=False)["disabled"], 2)
