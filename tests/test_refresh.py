@@ -147,6 +147,37 @@ def test_body_vocabulary_is_discovery_only_and_replaced_on_refresh(tmp_path):
                                   (corpus.COMMUNITY + "/Alpha",)).fetchone() == ("page_vocabulary_changed",)
 
 
+def test_structured_page_without_excerpt_is_retained_for_discovery(tmp_path):
+    from wiki_llm.dependencies.wingman_wiki.library import library_status, lookup, read_page
+    db = tmp_path / "wiki.sqlite3"
+    source = Publisher()
+    original_get = source.get
+
+    def page(url, limit=0):
+        if url in corpus.SITEMAPS:
+            return original_get(url, limit)
+        return ('<meta property="og:title" content="Alpha"><div id="mw-content-text">'
+                '<ul><li>Distinct tenders</li></ul><table><tr><td><p>'
+                'Recovered xenon cargo returns aboard returning xenon tenders.'
+                '</p></td></tr></table><span hidden>hiddenword</span><nav>navword</nav></div>')
+
+    source.get = page
+    report = refresh.refresh_once(db, publisher=source, batch_size=1, clock=lambda: 1000)
+    assert report.indexed == 1 and report.failed == 0
+    result = lookup(tmp_path, "xenon tenders", db_path=db)
+    link, = result["discovery_links"]
+    assert result["status"] == "no_matching_evidence" and result["references"] == []
+    assert link["citation"] == corpus.COMMUNITY + "/Alpha" and "excerpt" not in link
+    assert link["matched_on"] == "body_vocabulary" and link["insufficient_evidence"] is True
+    assert read_page(db, link["citation"])["status"] == "unavailable"
+    totals = library_status(db)["coverage_totals"]["star_citizen_preset"]
+    assert totals["unique_known_title_urls"] == 2 and totals["saved_community_excerpt_urls"] == 0
+    with sqlite3.connect(db) as connection:
+        assert connection.execute("SELECT extract FROM pages").fetchone() == ("",)
+        terms, = connection.execute("SELECT terms FROM page_vocabulary").fetchone()
+        assert terms == "aboard cargo distinct recovered returning returns tenders xenon"
+
+
 def test_shared_database_lease_and_expired_recovery(tmp_path):
     db = tmp_path / "wiki.sqlite3"
     entered, release = threading.Event(), threading.Event()

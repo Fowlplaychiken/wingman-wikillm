@@ -16,6 +16,7 @@ from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 from pathlib import Path
+from typing import NamedTuple
 from urllib.error import HTTPError, URLError
 from urllib.parse import unquote, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
@@ -366,12 +367,20 @@ def sitemap_entries(source: Publisher, url: str, seen: set[str]):
         raise ValueError(f"unrecognized sitemap: {url}")
 
 
+class ArticleElement(NamedTuple):
+    tag: str
+    in_article: bool
+    hidden: bool
+    in_table: bool
+    in_paragraph: bool
+
+
 class Article(HTMLParser):
     """Extract page identity, one short excerpt, and body vocabulary."""
 
     def __init__(self, body: str) -> None:
         super().__init__()
-        self.stack: list[tuple[str, bool, bool, bool]] = []
+        self.stack: list[ArticleElement] = []
         self.paragraph: list[str] = []
         self.vocabulary: set[str] = set()
         self.excerpt = ""
@@ -404,14 +413,17 @@ class Article(HTMLParser):
             "wbr",
         }:
             return
-        inside, blocked, para = self.stack[-1][1:] if self.stack else (False, False, False)
-        inside = inside or a.get("id") == "mw-content-text" or tag == "article"
-        blocked = blocked or tag in {"script", "style", "table", "aside", "nav", "figure"}
-        para = para or tag == "p"
-        self.stack.append((tag, inside, blocked, para))
+        parent = self.stack[-1] if self.stack else ArticleElement("", False, False, False, False)
+        self.stack.append(ArticleElement(
+            tag,
+            parent.in_article or a.get("id") == "mw-content-text" or tag == "article",
+            parent.hidden or "hidden" in a or tag in {"script", "style", "aside", "nav", "figure", "template"},
+            parent.in_table or tag == "table",
+            parent.in_paragraph or tag == "p",
+        ))
 
     def handle_endtag(self, tag):
-        i = next((i for i in range(len(self.stack) - 1, -1, -1) if self.stack[i][0] == tag), None)
+        i = next((i for i in range(len(self.stack) - 1, -1, -1) if self.stack[i].tag == tag), None)
         if i is None:
             return
         if tag == "p" and self.paragraph:
@@ -422,9 +434,13 @@ class Article(HTMLParser):
         del self.stack[i:]
 
     def handle_data(self, data):
-        if self.stack and self.stack[-1][1] and not self.stack[-1][2]:
-            self.vocabulary.update(re.findall(r"[a-zA-Z][a-zA-Z0-9-]{1,}|[0-9]+(?:\.[0-9]+){1,3}", data.casefold()))
-        if not self.excerpt and self.stack and self.stack[-1][1:] == (True, False, True):
+        if not self.stack:
+            return
+        element = self.stack[-1]
+        if not element.in_article or element.hidden:
+            return
+        self.vocabulary.update(re.findall(r"[a-zA-Z][a-zA-Z0-9-]{1,}|[0-9]+(?:\.[0-9]+){1,3}", data.casefold()))
+        if not self.excerpt and element.in_paragraph and not element.in_table:
             self.paragraph.append(data)
 
 
@@ -638,8 +654,8 @@ def crawl(
                 db.execute("DELETE FROM catalog_search WHERE url=?", (url,))
             continue
         stamp = article.updated
-        if not article.excerpt:
-            raise ValueError("publisher returned no usable article excerpt; last good page retained")
+        if not article.excerpt and not article.vocabulary:
+            raise ValueError("publisher returned no usable reader-visible article text; last good page retained")
         revision = int(article.revision.group(1)) if article.revision else None
         title = article.title or wiki_title(url)
         origin = publisher_name(url)
