@@ -45,12 +45,18 @@ def test_incremental_catalogs_and_page_batch(tmp_path):
     source = Publisher()
     first = refresh.refresh_once(db, publisher=source, batch_size=1, clock=lambda: 1000)
     assert first.indexed == 1
-    assert {x["state"] for x in first.catalogs.values()} == {"refreshed"}
+    assert first.catalogs == {
+        "community": {"state": "refreshed", "discovered": 2, "stale": False},
+        "support": {"state": "disabled"},
+        "official": {"state": "disabled"},
+        "galactapedia": {"state": "disabled"},
+    }
+    assert source.calls == [corpus.SITEMAPS[0], corpus.COMMUNITY + "/Alpha"]
     assert first.coverage["community"] == {"catalog_urls": 2, "indexed_pages": 1,
         "last_catalog_success": 1000.0, "last_catalog_error": None}
-    assert first.coverage["official"]["catalog_urls"] == 1
+    assert first.coverage["official"]["catalog_urls"] == 0
     assert first.coverage["support"]["indexed_pages"] == 0
-    assert first.coverage["galactapedia"]["catalog_urls"] == 1
+    assert first.coverage["galactapedia"]["catalog_urls"] == 0
     source.calls.clear()
     second = refresh.refresh_once(db, publisher=source, batch_size=1, clock=lambda: 1001)
     assert second.indexed == 1
@@ -63,9 +69,9 @@ def test_incremental_catalogs_and_page_batch(tmp_path):
 def test_catalog_failure_independent_and_last_good_kept(tmp_path):
     db = tmp_path / "wiki.sqlite3"
     source = Publisher()
-    refresh.refresh_once(db, publisher=source, clock=lambda: 1000)
+    refresh.refresh_once(db, publisher=source, clock=lambda: 1000, enabled_catalogs=refresh.CATALOGS)
     source.fail = {corpus.SITEMAPS[0], "galactapedia"}
-    report = refresh.refresh_once(db, publisher=source, clock=lambda: 90_000)
+    report = refresh.refresh_once(db, publisher=source, clock=lambda: 90_000, enabled_catalogs=refresh.CATALOGS)
     assert report.catalogs["community"]["state"] == "failed"
     assert report.catalogs["galactapedia"]["stale"]
     assert report.catalogs["support"]["state"] == "refreshed"
@@ -75,7 +81,7 @@ def test_catalog_failure_independent_and_last_good_kept(tmp_path):
         assert connection.execute("SELECT count(*) FROM wiki_urls WHERE status='removed'").fetchone()[0] == 0
     # Backoff applies to a new caller too; failures do not cause a request storm.
     source.calls.clear()
-    again = refresh.refresh_once(db, publisher=source, clock=lambda: 90_001)
+    again = refresh.refresh_once(db, publisher=source, clock=lambda: 90_001, enabled_catalogs=refresh.CATALOGS)
     assert again.catalogs["community"] == {"state": "not_due", "stale": True}
     assert source.calls == []
 
@@ -224,10 +230,12 @@ def test_success_status_error_page_cannot_replace_good_excerpt(tmp_path):
 
 def test_cli_once(tmp_path):
     output = io.StringIO()
+    source = Publisher()
     with contextlib.redirect_stdout(output):
-        result = refresh.main(["--db", str(tmp_path / "wiki.sqlite3"), "--batch-size", "1"], publisher=Publisher())
+        result = refresh.main(["--db", str(tmp_path / "wiki.sqlite3"), "--batch-size", "1"], publisher=source)
     assert result == 0
     assert json.loads(output.getvalue())["indexed"] == 1
+    assert source.calls == [corpus.SITEMAPS[0], corpus.COMMUNITY + "/Alpha"]
 
 
 def test_due_pages_and_new_pages_both_advance_with_one_item_batches(tmp_path):
@@ -319,7 +327,7 @@ def test_contact_phase_records_first_robots_timeout_without_private_detail(tmp_p
     source = corpus.Publisher()
     source.opener = Opener(timeout_robots=True)
     with patch.object(corpus, "robots_delay", return_value=0):
-        report = refresh.refresh_once(db, publisher=source, clock=lambda: 1000)
+        report = refresh.refresh_once(db, publisher=source, clock=lambda: 1000, enabled_catalogs=refresh.CATALOGS)
     assert report.catalogs["community"]["error_type"] == "TimeoutError"
     assert report.catalogs["official"]["state"] == "refreshed"
     assert corpus.SITEMAPS[0] not in source.opener.calls
@@ -406,18 +414,21 @@ def test_no_lastmod_catalog_changes_and_same_title_revision_preserve_all_notes(t
                     note_file.read_bytes())
 
     before = note_snapshot()
-    first = refresh.refresh_once(db, publisher=source, clock=lambda: 1000, catalog_interval=60, page_interval=120)
+    first = refresh.refresh_once(db, publisher=source, clock=lambda: 1000, catalog_interval=60,
+                                 page_interval=120, enabled_catalogs=refresh.CATALOGS)
     assert first.indexed == 2
     with sqlite3.connect(db) as conn:
         assert conn.execute("SELECT count(*) FROM source_changes").fetchone() == (0,)
     source.advance()
     source.calls.clear()
-    refresh.refresh_once(db, publisher=source, clock=lambda: 1061, catalog_interval=60, page_interval=120)
+    refresh.refresh_once(db, publisher=source, clock=lambda: 1061, catalog_interval=60,
+                         page_interval=120, enabled_catalogs=refresh.CATALOGS)
     assert corpus.COMMUNITY + "/Orion" not in source.calls  # bounded periodic revalidation, not every catalog poll
     assert WikiReference.search_catalog("renamed", db)[0]["title"] == "Orion catalog renamed"
     assert WikiReference.search_catalog("new slug", db)[0]["citation"].endswith("new-slug")
     assert not WikiReference.search_catalog("retired", db)
-    refresh.refresh_once(db, publisher=source, clock=lambda: 1121, catalog_interval=60, page_interval=120)
+    refresh.refresh_once(db, publisher=source, clock=lambda: 1121, catalog_interval=60,
+                         page_interval=120, enabled_catalogs=refresh.CATALOGS)
     with sqlite3.connect(db) as conn:
         changes = dict(conn.execute("SELECT url,reason FROM source_changes"))
         assert changes[corpus.GALACTAPEDIA + "/article/ABC123def0-orion"] == "catalog_title_changed"
@@ -428,8 +439,10 @@ def test_no_lastmod_catalog_changes_and_same_title_revision_preserve_all_notes(t
         assert conn.execute("SELECT count(*) FROM wiki_urls WHERE lastmod IS NOT NULL").fetchone() == (0,)
         observation = conn.execute("SELECT * FROM source_changes ORDER BY url").fetchall()
         assert all(row[1].endswith("+00:00") for row in observation)
-        assert all(not row[0].startswith(corpus.RSI) for row in source.calls)
-    refresh.refresh_once(db, publisher=source, clock=lambda: 1242, catalog_interval=60, page_interval=120)
+        assert all("/galactapedia/article/" not in url and "/comm-link/" not in url
+                   for url in source.calls)
+    refresh.refresh_once(db, publisher=source, clock=lambda: 1242, catalog_interval=60,
+                         page_interval=120, enabled_catalogs=refresh.CATALOGS)
     with sqlite3.connect(db) as conn:
         assert conn.execute("SELECT * FROM source_changes ORDER BY url").fetchall() == observation
     assert note_snapshot() == before
@@ -441,12 +454,12 @@ def test_no_lastmod_catalog_changes_and_same_title_revision_preserve_all_notes(t
 def test_partial_catalog_does_not_remove_or_rename_last_good_snapshot(tmp_path):
     db = tmp_path / "wiki.sqlite3"
     source = ChangingCatalogPublisher()
-    refresh.refresh_once(db, publisher=source, clock=lambda: 1000)
+    refresh.refresh_once(db, publisher=source, clock=lambda: 1000, enabled_catalogs=refresh.CATALOGS)
     with sqlite3.connect(db) as conn:
         before = conn.execute("SELECT url,title FROM catalog_search WHERE publisher!='Star Citizen Wiki' ORDER BY url").fetchall()
     source.advance()
     source.partial = True
-    failed = refresh.refresh_once(db, publisher=source, clock=lambda: 90_000)
+    failed = refresh.refresh_once(db, publisher=source, clock=lambda: 90_000, enabled_catalogs=refresh.CATALOGS)
     assert failed.catalogs["galactapedia"]["state"] == "failed"
     assert failed.catalogs["community"]["state"] == "refreshed"
     with sqlite3.connect(db) as conn:
@@ -509,11 +522,24 @@ def test_enabled_catalogs_disable_network_but_preserve_sources_and_notes(tmp_pat
                                    enabled_catalogs=(name for name in ["galactapedia"]))
     assert source.calls == ["galactapedia"] and only_lore.indexed == 0
     assert only_lore.coverage["community"]["indexed_pages"] == 2
+    with sqlite3.connect(db) as conn:
+        cached_lore = conn.execute("SELECT url,title FROM catalog_titles WHERE url LIKE ?",
+                                   (corpus.GALACTAPEDIA + "%",)).fetchall()
     source.calls.clear()
-    only_community = refresh.refresh_once(db, publisher=source, clock=lambda: 90_002,
+    automatic = refresh.refresh_once(db, publisher=source, clock=lambda: 90_002)
+    assert automatic.catalogs["galactapedia"] == {"state": "disabled"}
+    assert source.calls[0] == corpus.SITEMAPS[0]
+    assert all("robertsspaceindustries.com" not in url and "support.robertsspaceindustries.com" not in url
+               for url in source.calls)
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT url,title FROM catalog_titles WHERE url LIKE ?",
+                            (corpus.GALACTAPEDIA + "%",)).fetchall() == cached_lore
+    source.calls.clear()
+    only_community = refresh.refresh_once(db, publisher=source, clock=lambda: 180_003,
                                         page_interval=60, enabled_catalogs=["community"])
-    assert only_community.indexed == 2
-    assert source.calls == [corpus.SITEMAPS[0], corpus.COMMUNITY + "/Orion", corpus.COMMUNITY + "/Retired"]
+    assert only_community.catalogs["community"]["state"] in {"refreshed", "not_due"}
+    assert all(url == corpus.SITEMAPS[0] or url.startswith(corpus.COMMUNITY + "/")
+               for url in source.calls)
     with sqlite3.connect(db) as conn:
         assert conn.execute("SELECT count(*) FROM note_revisions").fetchone() == (1,)
 

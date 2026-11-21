@@ -177,7 +177,8 @@ def library_status(db_path=None, *, include_star_citizen=True, roots=()):
         with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as db:
             if db.execute("SELECT 1 FROM sqlite_master WHERE name='snapshot_pages'").fetchone():
                 db.create_function("enabled", 1, allowed)
-                imports = [{"origin": host, "saved_articles": count} for host, count in db.execute(
+                imports = [{"origin": host, "saved_articles": count, "full_text_articles": count}
+                           for host, count in db.execute(
                     "SELECT source_origin,count(distinct url) FROM snapshot_pages "
                     "WHERE enabled(url) AND trim(body, ?) != '' GROUP BY source_origin",
                     (SQLITE_WHITESPACE,))]
@@ -192,14 +193,35 @@ def library_status(db_path=None, *, include_star_citizen=True, roots=()):
                     inventory_basis="discovered URLs only")
     if include_star_citizen:
         counts = {}
+        acquisitions = {
+            "community": "automatic_paced_excerpts",
+            "support": "local_import_only",
+            "official": "local_import_only",
+            "galactapedia": "local_import_only",
+        }
+        catalog_names = ("community", "support", "official", "galactapedia")
+        last_updates = {row["name"]: row for row in _read(
+            path, "SELECT name,last_success,last_error FROM refresh_catalogs", (), "refresh_catalogs")}
         for row in _read(path, "SELECT url,pageid FROM wiki_urls WHERE status!='removed'", (), "wiki_urls"):
             group = counts.setdefault(corpus.catalog_owner(row["url"]), {"titles": 0, "excerpts": 0, "full_text_for_known_urls": 0, "missing_full_text": 0})
             group["titles"] += 1
             group["excerpts"] += row["pageid"] is not None
             group["full_text_for_known_urls"] += row["url"] in full
             group["missing_full_text"] += row["url"] not in full
-        status.update(star_citizen_library=counts, last_updates=_read(
-            path, "SELECT name,last_success,last_error FROM refresh_catalogs ORDER BY name", (), "refresh_catalogs"))
+        for name in catalog_names:
+            group = counts.setdefault(name, {"titles": 0, "excerpts": 0,
+                "full_text_for_known_urls": 0, "missing_full_text": 0})
+            group.update(indexed_titles=group["titles"], saved_excerpts=group["excerpts"],
+                         full_text_articles=group["full_text_for_known_urls"],
+                         automatic_acquisition=acquisitions[name],
+                         coverage_basis="cached title URLs; not a complete publisher inventory")
+            source_state = last_updates.get(name, {})
+            group.update(last_success=source_state.get("last_success"),
+                         last_error=source_state.get("last_error"))
+        status.update(star_citizen_library=counts, last_updates=[
+            {"name": name, **last_updates.get(name, {"last_success": None, "last_error": None}),
+             "automatic_acquisition": acquisitions[name]}
+            for name in catalog_names])
     return status
 
 
