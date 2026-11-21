@@ -99,3 +99,38 @@ def test_concurrent_retry_retains_distinct_wikis_and_one_row_per_address(tmp_pat
     assert all(result["status"] == "active" for result in results)
     assert set(effective_sources(path)[0]) == set(urls)
     assert len(manage_source(path, "list")["sources"]) == 2
+
+
+def test_remove_and_readd_preserves_saved_article_and_revision(tmp_path):
+    from wiki_llm.dependencies.wingman_wiki.library import read_page
+    from wiki_llm.dependencies.wingman_wiki.snapshots import import_snapshot
+
+    db = tmp_path / "wiki.sqlite"
+    article = {"title": "Engine", "text": "A steam engine.", "url": WIKI.replace("Main_Page", "Engine"), "revision": "8"}
+    snapshot = tmp_path / "edition.jsonl"
+    snapshot.write_text(json.dumps(article), encoding="utf8")
+    import_snapshot(db, snapshot)
+    manage_source(db, "add", WIKI)
+    assert manage_source(db, "remove", WIKI)["sources"] == []
+    roots, feeds = effective_sources(db)
+    assert read_page(db, article["url"], roots=roots, feeds=feeds, include_star_citizen=False)["status"] == "unavailable"
+    assert manage_source(db, "remove", WIKI)["status"] == "not_found"
+    manage_source(db, "add", WIKI)
+    roots, feeds = effective_sources(db)
+    saved = read_page(db, article["url"], roots=roots, feeds=feeds, include_star_citizen=False)
+    assert (saved["text"], saved["revision"]) == (article["text"], "8")
+
+
+def test_upgrade_and_remove_settings_source_without_losing_other_choices(tmp_path):
+    db = tmp_path / "wiki.sqlite"
+    with sqlite3.connect(db) as conn:
+        conn.execute("""CREATE TABLE source_choices(kind TEXT, url TEXT, added_definition TEXT,
+                     enabled INTEGER, setting_at_change INTEGER, PRIMARY KEY(kind,url))""")
+        conn.execute("INSERT INTO source_choices VALUES('wiki',?,?,1,NULL)", (WIKI, WIKI))
+    assert effective_sources(db, feeds=MAPPING) == ((WIKI,), parse_feeds(MAPPING))
+    removed = manage_source(db, "remove", API, kind="api", feeds=MAPPING)
+    assert removed["status"] == "removed"
+    assert effective_sources(db, feeds=MAPPING) == ((WIKI,), ())
+    assert manage_source(db, "list", feeds=MAPPING)["sources"] == removed["sources"]
+    assert manage_source(db, "add", API, kind="api", feeds=MAPPING)["status"] == "active"
+    assert effective_sources(db, feeds=MAPPING) == ((WIKI,), parse_feeds(MAPPING))
