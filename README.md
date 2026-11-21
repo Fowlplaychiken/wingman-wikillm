@@ -24,15 +24,15 @@ Open **WikiLLM’s skill settings** in Wingman.
 | A particular section | Use its directory URL ending in `/`, such as `https://wiki.openttd.org/en/Manual/`. |
 | No internet access from the skill | Turn **Check online wikis for updates** off. You can still add or replace a local export. |
 
-Save the settings. While the skill is loaded, WikiLLM checks the site’s sitemap and follows links to deeper pages within the chosen wiki. Each pass resumes where it left off. Ask **“How much of my wiki is available offline?”** to see what has been discovered and saved. Removing a URL hides that source from answers and stops its updates. Adding it back reuses its saved pages. Your field notes survive either change.
+Save the settings. For each chosen other-game wiki, WikiLLM checks the site’s sitemap and follows links to deeper pages. Each pass resumes where it left off. Ask **“How much of my wiki is available offline?”** to see what has been discovered and saved. Removing a URL hides that source from answers and stops its updates. Adding it back reuses its saved pages. Your field notes survive either change.
 
 ## What can it answer offline?
 
 | Source | What WikiLLM saves |
 | --- | --- |
-| Star Citizen preset | Cited starter guides covering flight, survival, industry and engineering. Updates add community wiki excerpts and revision links, plus a title index for Galactapedia, RSI Support and Comm-Link. A title alone is a lead for further reading. |
+| Star Citizen preset | Cited starter guides and paced community wiki excerpts. Previously saved Galactapedia, RSI Support and Comm-Link titles and links remain searchable; background updates do not contact RSI or its support site. A title alone is a lead for further reading. |
 | Other public wikis | Article passages on supported openly licensed pages, or a short excerpt where appropriate. Publishers can exclude paths or disallow storage. WikiLLM also checks for unlinked articles on compatible MediaWiki sites with an accessible page-list API. A sign-in, a JavaScript-only page or an unpublished page list can leave a gap. |
-| Local exports | Full article text from a MediaWiki XML (plain, gzip or bzip2) or article JSONL export (plain or gzip) you have permission to use. Add its original wiki URL to your enabled sources. Place the file in the library’s `snapshots` folder for automatic import on the next background pass. Replace the same file to update it. |
+| Local exports | Full article text from a MediaWiki XML (plain, gzip or bzip2) or article JSONL export (plain or gzip) you have permission to use, from any public source. Add its original article URL to an enabled source (supported RSI article routes use the Star Citizen preset; other publishers use **Other game wikis**). Place the file in the library’s `snapshots` folder for local import on the next background pass. Importing never contacts that publisher. Replace the same file to update it. |
 | Your field notes | Your observations, sources, game builds and corrections. Reviewed notes appear in answers. Drafts and withdrawn notes stay in the revision history. |
 
 Questions search the local index. Opening a publisher link uses the internet. For patch-sensitive questions, include the exact game build. WikiLLM can flag a reviewed claim when it observes a change to a cited source. A reference about a game mechanic describes the mechanic, and current player status still comes from the game.
@@ -45,7 +45,9 @@ Wingmen under the same computer user account share the library. Other players st
 
 ## Updates and backups
 
-The updater checks hourly while the skill is loaded. While it is making progress on newly discovered pages, it can take another batch after two minutes. Turn off **Build new libraries between scheduled updates** to use only your chosen interval. You can change the interval and batch size in the skill settings. Site delays and retries still apply. Coverage shows the number of discovered URLs still missing full article text. Only a publisher inventory or complete export can also account for unlinked pages. Full Star Citizen wiki mirrors are not included in the download. [Community wiki content signals](https://starcitizen.tools/robots.txt) · [Community wiki licensing](https://starcitizen.tools/Star_Citizen_Wiki:Copyrights) · [RSI terms](https://robertsspaceindustries.com/en/tos)
+The updater checks hourly while the skill is loaded. While it is making progress on newly discovered community wiki pages, it can take another batch after two minutes. Turn off **Build new libraries between scheduled updates** to use only your chosen interval. You can change the interval and batch size in the skill settings. Community site delays and retries still apply. RSI Terms section IV does not permit automated collection, so the built-in updater does not request RSI or RSI Support sitemaps or Galactapedia's catalog. Existing local title caches remain available, and authorized exports are imported locally. [RSI Terms](https://robertsspaceindustries.com/en/tos) · [Community wiki content signals](https://starcitizen.tools/robots.txt) · [Community wiki licensing](https://starcitizen.tools/Star_Citizen_Wiki:Copyrights)
+
+**Coverage is local and source-specific.** Status separates indexed title URLs, saved community excerpts, and complete article text. A title or excerpt is not full-text coverage; custom-wiki coverage is based on URLs discovered so far, not a complete publisher inventory. Imported full-text counts appear by publisher origin. A complete current export or independently supplied inventory is needed to account for unlinked pages.
 
 Back up the `.starcitizen-wiki` folder in your user home with Wingman closed. It holds the database, notes and any exports you added. To update the skill, replace only its folder under `custom_skills`. WikiLLM works independently of other skills and requires no Wingman Core changes.
 

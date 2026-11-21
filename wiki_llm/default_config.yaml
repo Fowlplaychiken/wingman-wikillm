@@ -1,7 +1,7 @@
 module: skills.wiki_llm.main
 name: WingmanWikiLLM
 api_version: 3
-version: 0.2.1
+version: 0.2.2
 display_name: WikiLLM
 author: Wingman WikiLLM contributors
 description:
@@ -28,13 +28,13 @@ auto_activate: false
 custom_properties:
 - id: auto_refresh
   name: Check online wikis for updates
-  hint: Switch off for offline use. WikiLLM can still import exports you put in the snapshots folder.
+  hint: Background updates use permitted community search and your chosen other wikis. Local exports still import when this is off.
   property_type: boolean
   value: true
   required: false
 - id: include_star_citizen
   name: Use the Star Citizen library
-  hint: Include the starter guides, Star Citizen Wiki, Galactapedia and RSI references.
+  hint: Include starter guides, permitted community excerpts and cached or locally imported Star Citizen references.
   property_type: boolean
   value: true
   required: false

@@ -117,6 +117,55 @@ class OfflineLibraryTests(unittest.TestCase):
             record_note("my-railway", "My railway", "I named my locomotive Grebe.", status="reviewed", db_path=self.db)
             self.assertTrue(lookup(GUIDES, "Grebe", db_path=self.db, include_star_citizen=False)["references"])
 
+    def test_authorized_rsi_local_import_is_available_without_automatic_acquisition(self):
+        from wiki_llm.dependencies.wingman_wiki.snapshots import import_snapshot
+        url = "https://robertsspaceindustries.com/comm-link/engineering/12345-Ship"
+        export = self.db.parent / "rsi-articles.jsonl"
+        export.write_text(json.dumps({"url": url, "title": "Ship engineering",
+            "text": "Authorized local export describes the power distribution system."}), encoding="utf-8")
+        with patch.object(socket, "socket", side_effect=AssertionError("network access")):
+            imported = import_snapshot(self.db, export)
+            self.assertEqual(imported["status"], "imported")
+            found = lookup(GUIDES, "power distribution", db_path=self.db)["references"]
+            self.assertEqual(found[0]["citation"], url)
+            self.assertEqual(read_page(self.db, url)["status"], "snapshot")
+            status = library_status(self.db)
+        assert_source = status["imported_articles"]
+        self.assertEqual(assert_source, [{"origin": "https://robertsspaceindustries.com",
+                                          "saved_articles": 1, "full_text_articles": 1}])
+        official = status["star_citizen_library"]["official"]
+        self.assertEqual((official["indexed_titles"], official["saved_excerpts"],
+                          official["full_text_articles"]), (0, 0, 0))
+        by_name = {row["name"]: row for row in status["last_updates"]}
+        self.assertEqual(by_name["official"]["automatic_acquisition"], "local_import_only")
+        self.assertEqual(by_name["community"]["automatic_acquisition"], "automatic_paced_excerpts")
+
+    def test_status_separates_cached_titles_excerpts_and_imported_full_text(self):
+        from wiki_llm.dependencies.wingman_wiki import corpus, refresh
+        from wiki_llm.dependencies.wingman_wiki.snapshots import import_snapshot
+        article = corpus.COMMUNITY + "/Coverage"
+
+        class CommunityPublisher:
+            def allowed(self, url):
+                return True
+
+            def get(self, url, limit=0):
+                if url == corpus.SITEMAPS[0]:
+                    return ('<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+                            f'<url><loc>{article}</loc></url></urlset>')
+                return ('<meta property="og:title" content="Coverage">'
+                        '<article><p>This short paragraph provides a cached community wiki excerpt.</p></article>')
+
+        refresh.refresh_once(self.db, publisher=CommunityPublisher(), clock=lambda: 1000,
+                             enabled_catalogs=("community",))
+        export = self.db.parent / "authorized-community.jsonl"
+        export.write_text(json.dumps({"url": article, "title": "Coverage",
+            "text": "Authorized local export contains the complete article text."}), encoding="utf-8")
+        import_snapshot(self.db, export)
+        community = library_status(self.db)["star_citizen_library"]["community"]
+        self.assertEqual((community["indexed_titles"], community["saved_excerpts"],
+                          community["full_text_articles"], community["missing_full_text"]), (1, 1, 1, 0))
+
     def test_new_evidence_marks_note_until_reviewed_again_on_same_day(self):
         url = "https://wiki.example.org/rail/Engine"
         result = record_note("engine", "Steam engine", "Coal", status="reviewed", source=url, db_path=self.db)

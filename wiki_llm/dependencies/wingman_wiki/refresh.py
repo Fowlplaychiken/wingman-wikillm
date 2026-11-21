@@ -30,11 +30,15 @@ CREATE TABLE IF NOT EXISTS refresh_hosts(host TEXT PRIMARY KEY, last_request REA
 CREATE TABLE IF NOT EXISTS refresh_queue(id INTEGER PRIMARY KEY CHECK(id=1),prefer_existing INTEGER NOT NULL);
 """
 CATALOGS = ("community", "support", "official", "galactapedia")
+AUTOMATIC_CATALOGS = ("community",)
 
 
 def _enabled_catalogs(values):
     if values is None:
-        return CATALOGS
+        # RSI Terms section IV does not permit automated collection. Keep the
+        # paced community-wiki route, and leave existing RSI title caches intact;
+        # an authorized caller may still opt into a separate supplied feed.
+        return AUTOMATIC_CATALOGS
     if isinstance(values, (str, bytes)):
         raise ValueError("enabled_catalogs must be an iterable of catalog names")
     try:
