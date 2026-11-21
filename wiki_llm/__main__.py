@@ -31,7 +31,7 @@ def main():
     commands.add_parser("status", help="Show local coverage of enabled sources")
     refresh = commands.add_parser("refresh", help="Update enabled sources once")
     refresh.add_argument("--batch-size", type=int, default=5)
-    snapshot = commands.add_parser("import", help="Import a local MediaWiki XML or article JSONL export")
+    snapshot = commands.add_parser("import", help="Import a local MediaWiki XML, article JSONL or the September 2023 Star Citizen archive")
     snapshot.add_argument("path", type=Path)
     inventory = commands.add_parser("verify", help="Compare saved article text against a publisher URL/revision inventory")
     inventory.add_argument("manifest", type=Path)
@@ -56,7 +56,8 @@ def main():
             result = import_snapshot(db, args.path, **snapshot_limits())
         else:
             result = asdict(refresh_once(db, batch_size=args.batch_size, enabled_catalogs=() if args.no_sc else None,
-                                         roots=roots, import_snapshots=True))
+                                         roots=roots, import_snapshots=True,
+                                         include_sc_edition=not args.no_sc))
     except (OSError, ValueError) as exc:
         parser.error(str(exc))
     print(json.dumps(result, ensure_ascii=True))

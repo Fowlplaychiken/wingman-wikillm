@@ -1,6 +1,6 @@
 # WikiLLM for Wingman
 
-Give your Wingman an offline library for the games you play. Ask a question by voice, get an answer with a link to the original article, and keep your own discoveries between sessions. Star Citizen comes preconfigured. You can use another game on its own or keep several wikis together.
+Ask your Wingman a Star Citizen question by voice, get a link to the original article, and keep your own discoveries between sessions. Star Citizen is the only game enabled by default. Players who want another game can add its wiki in settings.
 
 **[Download WikiLLM](https://github.com/Fowlplaychiken/wingman-wikillm/releases/latest)**
 
@@ -30,7 +30,7 @@ Save the settings. For each chosen other-game wiki, WikiLLM checks the site’s 
 
 | Source | What WikiLLM saves |
 | --- | --- |
-| Star Citizen preset | Cited starter guides and short excerpts from permitted community wiki pages. You can also find pages by words in their lists and tables, even on pages without an introductory paragraph. WikiLLM saves a deduplicated word list for discovery. A word-list match gives you the publisher’s title and link to follow. Previously saved Galactapedia, RSI Support and Comm-Link titles and links remain searchable. Background updates contact the community wiki only. |
+| Star Citizen preset | Cited starter guides, dated articles from the September 2023 community archive, and short excerpts from newer community pages. Words in lists and tables can also locate a page by title and link. Previously saved Galactapedia, RSI Support and Comm-Link titles and links remain searchable. |
 | Other public wikis | Article passages on supported openly licensed pages, or a short excerpt where appropriate. Publishers can exclude paths or disallow storage. WikiLLM also checks for unlinked articles on compatible MediaWiki sites with an accessible page-list API. A sign-in, a JavaScript-only page or an unpublished page list can leave a gap. |
 | Local exports | Full article text from a MediaWiki XML (plain, gzip or bzip2) or article JSONL export (plain or gzip) you have permission to use, from any public source. Add its original article URL to an enabled source (supported RSI article routes use the Star Citizen preset; other publishers use **Other game wikis**). Place the file in the library’s `snapshots` folder for local import on the next background pass. Importing never contacts that publisher. Replace the same file to update it. |
 | Your field notes | Your observations, sources, game builds and corrections. Reviewed notes appear in answers. Drafts and withdrawn notes stay in the revision history. |
@@ -42,6 +42,12 @@ Questions search the local index. Opening a publisher link uses the internet. Fo
 Say **“Save this as a draft field note”** and describe what you saw. Ask **“Which of my notes need review?”** to find drafts and notes whose sources have changed. Once you’ve checked the evidence, ask Wingman to mark the note reviewed and cite it. You can ask for its history, correct it or withdraw it. Your Wingman’s selected conversation model can also save findings during research. Background updates fetch and index sources without using model tokens.
 
 Wingmen under the same computer user account share the library. Other players start with their own notes. If you use a hosted conversation model, Wingman can send it the retrieved passages, including a matching private note. Choose a local conversation model if you want that exchange to stay on your hardware.
+
+## Historical Star Citizen articles
+
+The release includes a compact edition of Star Citizen Wiki articles. When you enable the Star Citizen library, WikiLLM indexes these articles locally, even with online updates off. Ask **“How much of my Star Citizen wiki is available offline?”** to see what your installation contains. [WikiTeam3’s September 2023 source archive](https://archive.org/details/wiki-starcitizen.tools-20230930)
+
+Star Citizen Wiki contributors wrote the articles, distributed under CC BY-SA 4.0. WikiLLM selects eligible article revisions from September 30, 2023 and repackages their source text with article links and credits. Redirects, media and identified third-party text are excluded. Answers identify the edition. Newer dated imports take precedence. Current patch mechanics and official Galactapedia entries need their own evidence. [Contributors and licensing](https://starcitizen.tools/Star_Citizen_Wiki:Copyrights) · [Article license](https://creativecommons.org/licenses/by-sa/4.0/)
 
 ## Updates and backups
 
