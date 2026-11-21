@@ -1,7 +1,7 @@
 module: skills.wiki_llm.main
 name: WingmanWikiLLM
 api_version: 3
-version: 0.2.3
+version: 0.2.4
 display_name: WikiLLM
 author: Wingman WikiLLM contributors
 description:
@@ -34,7 +34,7 @@ custom_properties:
   required: false
 - id: include_star_citizen
   name: Use the Star Citizen library
-  hint: Include starter guides, permitted community excerpts and cached or locally imported Star Citizen references.
+  hint: Include starter guides, permitted community excerpts, vocabulary-only discovery leads and cached or locally imported Star Citizen references.
   property_type: boolean
   value: true
   required: false

@@ -376,7 +376,7 @@ class WikiReference:
     @staticmethod
     def search_catalog(query: object, db_path: Path | str | None = None,
                        *, limit: int = _MAX_RESULTS) -> list[dict[str, Any]]:
-        """Return cited title candidates only; these are discovery leads, not evidence."""
+        """Return cited title/link candidates; body vocabulary is discovery, not evidence."""
         terms = _query_terms(query)
         if not terms or type(limit) is not int or not 1 <= limit <= _MAX_RESULTS:
             return []
@@ -388,7 +388,7 @@ class WikiReference:
             uri = path.resolve().as_uri() + "?mode=ro"
             with closing(sqlite3.connect(uri, uri=True, timeout=1.0)) as connection:
                 connection.execute("PRAGMA query_only=ON")
-                rows = connection.execute(
+                title_rows = connection.execute(
                     "SELECT catalog_search.url, catalog_search.title, catalog_search.publisher "
                     "FROM catalog_search JOIN wiki_urls "
                     "ON wiki_urls.url = catalog_search.url "
@@ -396,24 +396,46 @@ class WikiReference:
                     "ORDER BY bm25(catalog_search), title LIMIT ?",
                     (match, limit),
                 ).fetchall()
+                has_vocabulary = connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='page_vocabulary'"
+                ).fetchone()
+                if has_vocabulary:
+                    body_rows = connection.execute(
+                        "SELECT catalog_search.url, catalog_search.title, catalog_search.publisher "
+                        "FROM page_vocabulary "
+                        "JOIN page_sources ON page_sources.pageid = page_vocabulary.rowid "
+                        "JOIN wiki_urls ON wiki_urls.url = page_sources.url "
+                        "JOIN catalog_search ON catalog_search.url = page_sources.url "
+                        "WHERE page_vocabulary MATCH ? AND wiki_urls.status != 'removed' "
+                        "AND page_sources.publisher = 'Star Citizen Wiki' "
+                        "ORDER BY bm25(page_vocabulary), catalog_search.title LIMIT ?",
+                        (match, limit),
+                    ).fetchall()
+                else:
+                    # Existing databases acquire this index on their next paced refresh.
+                    body_rows = []
         except (OSError, sqlite3.Error, ValueError):
             return []
         results = []
-        for url, title, publisher in rows:
-            if (type(url) is not str or type(title) is not str or not title.strip()
+        seen = set()
+        for rows, matched_on in ((body_rows, "body_vocabulary"), (title_rows, "title")):
+            for url, title, publisher in rows:
+                if (type(url) is not str or type(title) is not str or not title.strip()
                     or type(publisher) is not str or not publisher.strip()):
-                continue
-            parsed = urlsplit(url)
-            if (parsed.scheme != "https" or parsed.netloc not in {
+                    continue
+                parsed = urlsplit(url)
+                if (parsed.scheme != "https" or parsed.netloc not in {
                     "starcitizen.tools", "robertsspaceindustries.com",
                     "support.robertsspaceindustries.com",
-            } or parsed.query or parsed.fragment):
-                continue
-            results.append({
-                "title": title[:256], "citation": url,
-                "publisher": publisher[:128],
-                "source_kind": "cached_catalog_candidate",
-                "insufficient_evidence": True,
-                "game_build": None, "game_build_state": "unknown", "live_state": False,
-            })
-        return results
+                } or parsed.query or parsed.fragment or url in seen):
+                    continue
+                seen.add(url)
+                results.append({
+                    "title": title[:256], "citation": url,
+                    "publisher": publisher[:128],
+                    "source_kind": "cached_catalog_candidate",
+                    "matched_on": matched_on,
+                    "insufficient_evidence": True,
+                    "game_build": None, "game_build_state": "unknown", "live_state": False,
+                })
+        return results[:limit]
