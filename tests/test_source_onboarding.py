@@ -92,6 +92,24 @@ def test_json_alias_detection_persists_mapping_and_background_refresh_reads_it(t
     assert result["url"] == ARTICLE
 
 
+def test_explicit_cursor_mapping_previews_as_a_same_origin_continuation(tmp_path, publisher):
+    db = tmp_path / "wiki.db"
+    token = "https://outside.example/path?api_key=dummy&part=2"
+    publisher.pages[API] = _json({"results": [
+        {"name": "Glacier", "description": "An ice creature.", "url": ARTICLE},
+    ], "count": 2, "pagination": {"nextCursor": token}})
+    mapping = json.dumps({"url": API, "next": "pagination.nextCursor", "next_param": "cursor"})
+
+    preview = setup_source(db, "preview", mapping)
+
+    assert preview["status"] == "ready"
+    assert preview["preview"]["publisher_reported_total"] == 2
+    assert preview["preview"]["more_pages"] is True
+    assert preview["source"]["url"] == API
+    assert effective_sources(db) == ((), ())
+    assert publisher.calls == [HOST + "/robots.txt", API]
+
+
 def test_conflicting_collections_require_one_choice_and_advanced_mapping_still_works(tmp_path, publisher):
     db = tmp_path / "wiki.db"
     catalog = [{"codename": "Glacier", "details": {"history": "Glaciers predate the realms."}, "id": "Glacier"}]

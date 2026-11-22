@@ -18,7 +18,7 @@ import re
 import sqlite3
 import time
 import zlib
-from urllib.parse import unquote, urljoin, urlsplit, urlunsplit
+from urllib.parse import unquote, unquote_plus, urlencode, urljoin, urlsplit, urlunsplit
 
 from . import corpus, web_sources
 from .snapshots import _public_url, import_snapshot
@@ -31,7 +31,7 @@ FAILURE_BACKOFF = 15 * 60
 MAX_FAILURE_BACKOFF = 24 * 60 * 60
 
 _FIELDS = {"url", "items", "title", "text", "url_field", "next", "total",
-           "url_template", "id_field"}
+           "url_template", "id_field", "next_param"}
 _DEFAULT_ITEMS = ("results", "items", "data", "records", "entries")
 
 _SCHEMA = """
@@ -97,10 +97,13 @@ class JsonFeed:
     total: str = "total|count|meta.total"
     url_template: str | None = None
     id_field: str | None = None
+    next_param: str | None = None
 
     @property
     def mapping_sha256(self) -> str:
-        value = {name: getattr(self, name) for name in _FIELDS}
+        # Keep the legacy mapping digest stable when this optional feature is unused.
+        value = {name: getattr(self, name) for name in _FIELDS
+                 if name != "next_param" or self.next_param is not None}
         return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
@@ -171,6 +174,13 @@ def _normalize_feed(raw: object) -> JsonFeed:
         else:
             value = _mapping_value(value, key, optional=key == "id_field")
         values[key] = value
+    next_param = raw.get("next_param")
+    if next_param is not None:
+        if (not isinstance(next_param, str) or not re.fullmatch(r"[A-Za-z0-9_.~-]{1,100}", next_param)):
+            raise ValueError("JSON field mapping 'next_param' must be a simple query parameter name")
+        values["next_param"] = next_param
+    else:
+        values["next_param"] = None
     template = values["url_template"]
     ident = values["id_field"]
     if (template is None) != (ident is None):
@@ -452,7 +462,17 @@ def _fail(db, feed: JsonFeed, now: float, error: Exception, *, policy: bool = Fa
 
 def _extract_next(payload: object, feed: JsonFeed, base_url: str, response, cached) -> str | None:
     value = _select(payload, feed.next)
-    if value not in (None, "", False):
+    if feed.next_param is not None:
+        if value is not None and value is not False and not (type(value) is str and value == ""):
+            if type(value) not in (str, int):
+                raise ValueError("JSON pagination field must be a token or integer when next_param is set")
+            parts = urlsplit(base_url)
+            query = [item for item in parts.query.split("&")
+                     if unquote_plus(item.partition("=")[0]) != feed.next_param]
+            query.append(urlencode([(feed.next_param, str(value))]))
+            target = urlunsplit((parts.scheme, parts.netloc, parts.path, "&".join(query), ""))
+            return _same_origin(target, base_url)
+    elif value not in (None, "", False):
         if not isinstance(value, str):
             raise ValueError("JSON pagination field must be a URL string or null")
         return _same_origin(value, base_url)
