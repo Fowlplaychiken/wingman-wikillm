@@ -155,7 +155,10 @@ class OfflineLibraryTests(unittest.TestCase):
         record_note("hurston-visibility", "Hurston visibility", "Local haze.",
                     status="withdrawn", db_path=self.db)
         topics = note_topics("Aberdeen visibility", self.db)
-        self.assertEqual([entry["slug"] for entry in topics], ["aby-visibility", "aby-heat"])
+        self.assertEqual([entry["slug"] for entry in topics], ["aby-visibility"])
+        self.assertEqual({entry["slug"] for entry in note_topics("Aberdeen", self.db)},
+                         {"aby-heat", "aby-visibility"})
+        self.assertFalse(note_topics("Alkyd survey visibility", self.db))
         self.assertEqual(topics[0], {"slug": "aby-visibility", "title": "Aberdeen visibility",
                                      "revision": 2, "status": "draft", "game_build": "4.6.0", "exact": 1})
         self.assertEqual(note_topics("hurston-visibility", self.db)[0]["status"], "withdrawn")
