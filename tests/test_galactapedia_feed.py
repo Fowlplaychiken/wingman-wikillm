@@ -5,8 +5,13 @@ import sqlite3
 from urllib.error import HTTPError
 from urllib.parse import parse_qs, urlsplit
 from io import BytesIO
+from contextlib import closing
+
+import pytest
 
 from wiki_llm.dependencies.wingman_wiki import galactapedia_feed as feed
+from wiki_llm.dependencies.wingman_wiki.library import note_history, record_note
+from wiki_llm.dependencies.wingman_wiki.snapshots import import_snapshot, read_snapshot_page
 
 
 class Clock:
@@ -57,6 +62,9 @@ class FakeAPI:
         self.modified = {}
         self.requests = []
         self.page_bodies = 0
+        self.page_headers = {}
+        self.catalog_responses = []
+        self.robots_content_signal = None
         self.failures = {}
         self.disallow_pages = False
         self.set_revision(0)
@@ -81,6 +89,8 @@ class FakeAPI:
         if parsed.path == "/robots.txt":
             rules = "User-agent: *\nDisallow: /api/galactapedia\n" if self.disallow_pages else (
                 "User-agent: *\nAllow: /\nCrawl-delay: 0\n")
+            if self.robots_content_signal:
+                rules += f"Content-Signal: {self.robots_content_signal}\n"
             return Response(url, 200, {"Content-Type": "text/plain"}, rules.encode())
         page = int(parse_qs(parsed.query)["page[number]"][0])
         if page in self.failures:
@@ -90,8 +100,11 @@ class FakeAPI:
                 headers["Retry-After"] = str(retry)
             raise HTTPError(url, status, "fixture failure", headers, BytesIO(b""))
         modified = self.modified[page]
+        headers = {"Last-Modified": modified, **self.page_headers}
         if request.get_header("If-modified-since") == modified:
-            return Response(url, 304, {"Last-Modified": modified})
+            response = Response(url, 304, headers)
+            self.catalog_responses.append(response)
+            return response
         start = (page - 1) * self.page_size
         rows = self.rows[start:start + self.page_size]
         body = json.dumps({
@@ -101,7 +114,9 @@ class FakeAPI:
                      "per_page": self.page_size, "total": len(self.rows)},
         }).encode()
         self.page_bodies += 1
-        return Response(url, 200, {"Last-Modified": modified}, body)
+        response = Response(url, 200, headers, body)
+        self.catalog_responses.append(response)
+        return response
 
 
 def setup(monkeypatch, rows, tmp_path):
@@ -279,6 +294,86 @@ def test_partial_page_failure_preserves_catalog_snapshot_and_cache_with_backoff(
     assert backoff["status"] == "backoff"
     assert len(api.requests) == requests_before
     assert feed.feed_status(db_path, clock=clock)["titles"] == 3
+
+
+def test_storage_denial_on_first_200_does_not_read_catalog_body(monkeypatch, tmp_path):
+    db, api, clock = setup(monkeypatch, [
+        article("A000000001", "alpha-one", "Alpha One", "Alpha lore body."),
+    ], tmp_path)
+    api.page_headers = {"Cache-Control": "max-age=60, no-store"}
+
+    result = feed.refresh_galactapedia(db, opener=api, clock=clock, interval=60, failure_backoff=60)
+
+    assert result["status"] == "blocked"
+    response, = api.catalog_responses
+    assert response.status == 200
+    assert response.bytes_read == 0
+    status = feed.feed_status(db, clock=clock)
+    assert status["status"] == "blocked"
+    assert status["article_bodies"] == status["retained_prior_bodies"] == 0
+    with closing(sqlite3.connect(db)) as conn:
+        assert conn.execute("SELECT count(*) FROM galactapedia_feed_pages").fetchone() == (0,)
+
+
+def test_storage_denial_on_304_withdraws_only_feed_and_recovers(monkeypatch, tmp_path):
+    db, api, clock = setup(monkeypatch, [
+        article("A000000001", "alpha-one", "Alpha One", "Alpha lore body."),
+    ], tmp_path)
+    options = dict(opener=api, clock=clock, interval=60, failure_backoff=60)
+    assert feed.refresh_galactapedia(db, **options)["article_bodies"] == 1
+    url = "https://robertsspaceindustries.com/galactapedia/article/A000000001-alpha-one"
+    independent = tmp_path / "independent.jsonl"
+    independent.write_text(json.dumps({
+        "url": url, "title": "Authorized independent Alpha", "text": "Independent body.",
+    }) + "\n", encoding="utf-8")
+    imported = import_snapshot(db, independent)
+    record_note("private-alpha", "Private Alpha", "My own Alpha observations.",
+                status="reviewed", source=url, db_path=db)
+    notes = note_history("private-alpha", db)
+
+    clock.advance(61)
+    api.page_headers = {"X-Robots-Tag": "noarchive"}
+    result = feed.refresh_galactapedia(db, **options)
+
+    assert result["status"] == "blocked"
+    assert api.catalog_responses[-1].status == 304
+    assert api.catalog_responses[-1].bytes_read == 0
+    status = feed.feed_status(db, clock=clock)
+    assert status["status"] == "blocked"
+    assert status["article_bodies"] == status["retained_prior_bodies"] == 0
+    assert snapshot_rows(db) == []
+    assert read_snapshot_page(db, url)["source_id"] == imported["source_id"]
+    assert note_history("private-alpha", db) == notes
+    with closing(sqlite3.connect(db)) as conn:
+        assert conn.execute("SELECT count(*) FROM galactapedia_feed_pages").fetchone() == (0,)
+
+    clock.advance(61)
+    api.page_headers.clear()
+    restored = feed.refresh_galactapedia(db, **options)
+
+    assert restored["status"] == "success"
+    assert restored["bodies_downloaded"] == 1
+    assert feed.feed_status(db, clock=clock)["article_bodies"] == 1
+    assert snapshot_rows(db)[0][2] == "Alpha lore body."
+
+
+@pytest.mark.parametrize("signal", ["search=no", "ai-input=no"])
+def test_matching_robots_storage_signal_blocks_before_catalog_contact(monkeypatch, tmp_path, signal):
+    db, api, clock = setup(monkeypatch, [
+        article("A000000001", "alpha-one", "Alpha One", "Alpha lore body."),
+    ], tmp_path)
+    options = dict(opener=api, clock=clock, interval=60, failure_backoff=60)
+    assert feed.refresh_galactapedia(db, **options)["article_bodies"] == 1
+
+    clock.advance(feed.ROBOTS_INTERVAL + 1)
+    api.robots_content_signal = signal
+    api.requests.clear()
+    result = feed.refresh_galactapedia(db, **options)
+
+    assert result["status"] == "blocked"
+    assert [urlsplit(request["url"]).path for request in api.requests] == ["/robots.txt"]
+    assert feed.feed_status(db, clock=clock)["article_bodies"] == 0
+    assert snapshot_rows(db) == []
 
 
 def test_retry_after_extends_feed_backoff_and_cross_origin_redirect_is_rejected(monkeypatch, tmp_path):

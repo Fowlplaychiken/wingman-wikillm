@@ -28,6 +28,7 @@ from typing import Any
 
 from . import corpus
 from .snapshots import MAX_PAGE_CHARS, _source_id, import_snapshot
+from .web_sources import _storage_policy
 
 API_URL = "https://api.star-citizen.wiki/api/galactapedia"
 API_HOST = "api.star-citizen.wiki"
@@ -96,6 +97,10 @@ class GalactapediaFeedError(ValueError):
         super().__init__(message)
         self.http_status = http_status
         self.retry_at = retry_at
+
+
+class GalactapediaStorageDenied(GalactapediaFeedError):
+    """The publisher does not allow this feed to serve stored article text."""
 
 
 class _SameOriginRedirect(urllib.request.HTTPRedirectHandler):
@@ -191,7 +196,9 @@ def feed_status(db_path: Path | str, *, clock=time.time) -> dict[str, Any]:
     now = clock()
     (attempt, success, next_attempt, failures, error, http_status, pages,
      titles, bodies, retained, placeholders, missing, discovered, source_id) = row
-    if error:
+    if error == GalactapediaStorageDenied.__name__:
+        state = "blocked"
+    elif error:
         state = "error"
     elif success is None:
         state = "not_started"
@@ -250,12 +257,25 @@ def _page_url(page: int) -> str:
     return API_URL + "?" + query
 
 
-def _read_response(response) -> tuple[int, dict[str, str], bytes, int]:
+def _read_response(response, *, article=False) -> tuple[int, dict[str, str], bytes, int]:
     status = getattr(response, "status", None) or getattr(response, "code", 200)
-    headers = {str(k).casefold(): str(v) for k, v in response.headers.items()}
+    headers: dict[str, str] = {}
+    for name, value in response.headers.items():
+        key = str(name).casefold()
+        if key in headers and key in {"content-signal", "x-robots-tag", "cache-control", "use"}:
+            headers[key] += ", " + str(value)
+        else:
+            headers[key] = str(value)
     final = urllib.parse.urlsplit(response.geturl())
     if final.scheme != "https" or final.hostname != API_HOST:
         raise GalactapediaFeedError("API redirected outside its public origin")
+    policy = dict(headers)
+    policy["content-signal"] = policy.get("content-signal", "") + ", " + ", ".join(
+        "use=" + token.strip() for token in policy.get("use", "").split(",") if token.strip()
+    )
+    if article and status in (200, 304) and any(_storage_policy(policy)):
+        raise GalactapediaStorageDenied("Publisher response forbids offline article storage",
+                                        http_status=status)
     if status == 304:
         return status, headers, b"", 0
     raw = response.read(MAX_RESPONSE_BYTES + 1)
@@ -304,7 +324,7 @@ def _request_page(page: int, cached: dict[str, Any] | None, *, opener, stop_even
                                        retry_at=retry_at) from None
         response = error
     try:
-        status, response_headers, raw, wire_bytes = _read_response(response)
+        status, response_headers, raw, wire_bytes = _read_response(response, article=True)
     finally:
         response.close()
     _cancelled(stop_event)
@@ -362,11 +382,6 @@ def _get_robots(db_path: Path, *, opener, stop_event, clock,
             raise GalactapediaFeedError("API robots.txt is not UTF-8") from error
     _cancelled(stop_event)
     delay = max(MIN_REQUEST_INTERVAL, corpus.robots_delay(body, floor=MIN_REQUEST_INTERVAL))
-    # Check this fixed public feed URL before any catalog request is sent.
-    page = urllib.parse.urlsplit(_page_url(1))
-    page_path = page.path + ("?" + page.query if page.query else "")
-    if not corpus.allowed_by_robots(body, page_path):
-        raise GalactapediaFeedError("API robots.txt disallows the Galactapedia feed")
     with closing(_connect(db_path)) as db, db:
         db.execute("""INSERT INTO galactapedia_feed_robots(id,body,fetched_at,crawl_delay)
             VALUES(1,?,?,?) ON CONFLICT(id) DO UPDATE SET body=excluded.body,
@@ -614,7 +629,16 @@ def _clear_snapshot_source(db: sqlite3.Connection, source_id: str, observed_at: 
 
 def _record_failure(db_path: Path, *, now: float, error: Exception,
                     base_backoff: float) -> dict[str, Any]:
+    blocked = isinstance(error, GalactapediaStorageDenied)
     with closing(_connect(db_path)) as db, db:
+        if blocked:
+            source_id = _source_id(db_path.parent / IMPORT_FILENAME)
+            _clear_snapshot_source(db, source_id, datetime.fromtimestamp(now, UTC).isoformat())
+            db.execute("DELETE FROM galactapedia_feed_pages")
+            db.execute("DELETE FROM galactapedia_feed_gaps")
+            db.execute("""UPDATE galactapedia_feed_state SET last_success=NULL, page_count=0,
+                total_titles=0, article_bodies=0, retained_prior_bodies=0, placeholders=0,
+                missing=0, discovery_time=NULL, source_id=NULL, content_sha256=NULL WHERE id=1""")
         row = db.execute("SELECT failure_count FROM galactapedia_feed_state WHERE id=1").fetchone()
         failures = (row[0] if row else 0) + 1
         delay = min(MAX_FAILURE_BACKOFF, base_backoff * (2 ** min(failures - 1, 12)))
@@ -629,7 +653,9 @@ def _record_failure(db_path: Path, *, now: float, error: Exception,
               next_attempt=excluded.next_attempt,failure_count=excluded.failure_count,
               last_error=excluded.last_error,last_http_status=excluded.last_http_status""",
             (now, next_attempt, failures, type(error).__name__, status))
-    return {"status": "failed", "error_type": type(error).__name__,
+    if blocked:
+        (db_path.parent / IMPORT_FILENAME).unlink(missing_ok=True)
+    return {"status": "blocked" if blocked else "failed", "error_type": type(error).__name__,
             "http_status": status, "failure_count": failures, "next_attempt": next_attempt}
 
 
@@ -723,6 +749,10 @@ def refresh_galactapedia(db_path: Path | str, *, stop_event=None, clock=time.tim
         pacer = _RequestPacer(MIN_REQUEST_INTERVAL, stop_event)
         robots, crawl_delay, robots_bytes = _get_robots(
             path, opener=opener, stop_event=stop_event, clock=clock, pacer=pacer)
+        signals = ", ".join(value for group in corpus.robots_groups(robots)
+                            for key, value in group if key == "content-signal")
+        if any(_storage_policy({"content-signal": signals})):
+            raise GalactapediaStorageDenied("Publisher robots.txt forbids offline article storage")
         pacer.interval = max(MIN_REQUEST_INTERVAL, crawl_delay)
         from .refresh import snapshot_limits
         limits = snapshot_limits()

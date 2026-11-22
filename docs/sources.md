@@ -39,12 +39,14 @@ For a whole wiki, supply its home URL. For a section, use its directory URL endi
 
 Place a permitted **MediaWiki XML** export (plain, gzip or bzip2) or **article JSONL** export (plain or gzip) in `.starcitizen-wiki/snapshots` in your user folder. Enable that publisher in WikiLLM. The next background pass picks up the file even if online updates are off. Replace the same file to update the edition. Each JSONL line needs `url`, `title` and `text`. Optional `revision` and `game_build` identify the edition.
 
-From the source checkout or the parent of the installed skill folder, you can check against the publisher’s own URL list. Use one JSON object with `url` and optional `revision` per line. The check reports missing, excerpt-only or unverified entries. Adding `--queue-missing` schedules undiscovered URLs within an enabled custom wiki for the next pass.
+With Python 3.11 or newer, you can check against the publisher’s URL list from the source checkout or the parent of the installed skill folder. The Wingman skill uses Wingman’s own runtime. Use one JSON object with `url` and optional `revision` per line. The check reports missing, excerpt-only or unverified entries. Adding `--queue-missing` schedules undiscovered URLs within an enabled custom wiki for the next pass.
 
 ```shell
-python -m wiki_llm --no-sc --wiki https://wiki.wesnoth.org/ verify inventory.jsonl --queue-missing
-python -m wiki_llm --help
+py -3.11 -m wiki_llm --no-sc --wiki https://wiki.wesnoth.org/ verify inventory.jsonl --queue-missing
+py -3.11 -m wiki_llm --help
 ```
+
+On macOS or Linux, use `python3 -m wiki_llm` with Python 3.11 or newer.
 
 For a large local export, the defaults per file are 512 MiB on disk, 2 GiB expanded and two million pages. Set `WIKILLM_SNAPSHOT_MAX_COMPRESSED_BYTES`, `WIKILLM_SNAPSHOT_MAX_EXPANDED_BYTES` or `WIKILLM_SNAPSHOT_MAX_PAGES` before starting Wingman to change a limit. Zero removes that aggregate limit.
 
@@ -59,5 +61,7 @@ On 22 November 2026, WikiLLM followed all 15 pages of RSI’s official article c
 The community API supplied 1,480 distinct records, including 1,479 English bodies and the Odin placeholder. Its extra saved body was **Terrence Akari** (`V3qgjK7Jor`), which did not appear in that day’s RSI catalog. A conditional check of all 15 cached community API pages returned HTTP 304. The counts describe this edition and date. Players can keep private field notes alongside the saved articles. [Community API](https://api.star-citizen.wiki/developers)
 
 ### Packaged revision retention check (2026-11-22)
+
+If the Galactapedia feed revokes offline storage, WikiLLM withdraws its saved feed articles and validators. Your notes and separately imported editions stay available. During a temporary outage, WikiLLM keeps the last allowed edition.
 
 An isolated upgrade from the packaged 0.3.4 skill to 0.3.5 reused the same external settings profile and personal library. Extra wiki/API source choices, a paused API source, and the Star Citizen/Galactapedia switches remained effective. A controlled feed update for the real Odin ID (`RMNaBDyx6W`) changed its saved state from publisher placeholder to article body while the private database note, a deployment-curated Markdown note, and the bundled curated guide remained readable. The next unchanged pass used the saved validator and downloaded no body. This checks package replacement and revision handling, not a new live publisher edit or an installed Wingman acceptance; the current live feed observation above returned 304 for all 15 stored pages.
