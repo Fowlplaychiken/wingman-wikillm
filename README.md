@@ -29,8 +29,10 @@ Say **“How much of this wiki can I read offline?”** Coverage depends on the 
 
 ## Your field notes
 
-Tell your Wingman what you observed. It can draft a new note, revise an existing topic when you correct it, and file a finding you confirm. Reviewed notes can appear alongside the article they refer to. A source update preserves your notes and flags changed citations. Ask **“What have we learned about Aberdeen?”** or **“Which of my notes need review?”**
+- **Add a note:** “Remember that I saw fog on Aberdeen near the ridge.”
+- **Correct it later:** “Update my Aberdeen note. I saw the fog on a different route.” Wingman looks for the existing topic and keeps its earlier revisions.
+- **Review drafts:** “Which notes need review?” Confirm a finding before Wingman uses it as a fact.
 
-Notes stay in your computer user’s library. If your Wingman uses a hosted model, it can send matching passages and notes to that provider. Turn off **Automatically draft game notes** if you prefer to decide when to save.
+With **Automatically draft game notes** on, Wingman can draft notes from concrete observations you share. Turn it off to save only when you ask. Notes stay in your local library. A hosted Wingman model can receive the notes it uses in an answer.
 
 To back up, close Wingman and copy `.starcitizen-wiki` from your user folder. To upgrade, replace the skill folder with the latest ZIP. [Community article license and attribution](docs/sources.md#community-archive)

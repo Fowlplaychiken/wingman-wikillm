@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from wiki_llm.dependencies.wingman_wiki.library import check_inventory, library_status, lookup, note_history, read_page, record_note
+from wiki_llm.dependencies.wingman_wiki.library import check_inventory, library_status, lookup, note_history, note_topics, read_page, record_note
 
 GUIDES = Path(__file__).resolve().parents[1] / "wiki_llm" / "guides"
 
@@ -144,6 +144,42 @@ class OfflineLibraryTests(unittest.TestCase):
         write("Superseded after independent check", "withdrawn", 3)
         self.assertFalse(lookup(GUIDES, "Quasar", db_path=self.db)["references"])
         self.assertEqual(len(note_history("quasar", self.db)), 4)
+
+    def test_note_topics_against_drafts_and_reviewed_history(self):
+        record_note("aby-visibility", "Aberdeen visibility", "Visible from the ridge.",
+                    status="reviewed", game_build="4.5.0", db_path=self.db)
+        record_note("aby-visibility", "Aberdeen visibility", "Fog on another route.",
+                    status="draft", previous_revision=1, game_build="4.6.0", db_path=self.db)
+        record_note("aby-heat", "Aberdeen heat", "Hot at noon.",
+                    status="draft", db_path=self.db)
+        record_note("hurston-visibility", "Hurston visibility", "Local haze.",
+                    status="withdrawn", db_path=self.db)
+        topics = note_topics("Aberdeen visibility", self.db)
+        self.assertEqual([entry["slug"] for entry in topics], ["aby-visibility", "aby-heat"])
+        self.assertEqual(topics[0], {"slug": "aby-visibility", "title": "Aberdeen visibility",
+                                     "revision": 2, "status": "draft", "game_build": "4.6.0", "exact": 1})
+        self.assertEqual(note_topics("hurston-visibility", self.db)[0]["status"], "withdrawn")
+        private = lookup(GUIDES, "Aberdeen visibility", db_path=self.db, include_star_citizen=False)
+        self.assertIn("Visible from the ridge.", private["references"][0]["excerpt"])
+
+    def test_identical_retry_reuses_revision_and_a_later_review_can_reaffirm(self):
+        def save(previous, status):
+            return record_note("aby-weather", "Aberdeen weather", "Fog by the ridge.",
+                               status=status, previous_revision=previous, db_path=self.db)
+
+        self.assertEqual(save(0, "draft")["revision"], 1)
+        self.assertTrue(save(0, "draft")["unchanged"])
+        self.assertTrue(save(1, "draft")["unchanged"])
+        self.assertEqual(save(1, "reviewed")["revision"], 2)
+        self.assertTrue(save(1, "reviewed")["unchanged"])
+        self.assertEqual(save(2, "reviewed")["revision"], 3)
+        self.assertEqual(len(note_history("aby-weather", self.db)), 3)
+        with self.assertRaisesRegex(ValueError, "aby-weather already uses that title"):
+            record_note("weather-aberdeen", "ABERDEEN WEATHER", "Fog.",
+                        status="draft", automatic=True, db_path=self.db)
+        self.assertFalse(note_history("weather-aberdeen", self.db))
+        with self.assertRaisesRegex(ValueError, "revision 3"):
+            save(0, "reviewed")
 
     def test_existing_markdown_note_uses_its_public_source(self):
         notes = self.db.parent / "notes"
