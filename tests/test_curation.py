@@ -58,14 +58,33 @@ def _load_main_module():
 class CurationTests:
     def test_native_tool_choices_and_one_publisher_status_after_reopen(self):
         module = _load_main_module()
+        web = module.setup_source.__globals__["web_sources"]
+        def transport(url, headers, *, validate_url):
+            validate_url(url)
+            if url.endswith("/robots.txt"):
+                return web.Response(404, {}, b"")
+            return web.Response(200, {"Content-Type": "text/html"}, b"<html><title>Game Wiki</title>"
+                                b"<main><p>A searchable reference for the game.</p></main></html>")
         with tempfile.TemporaryDirectory() as directory:
             db = Path(directory) / "my.sqlite3"
-            with patch.object(module, "community_db_path", return_value=db), patch.object(module, "RefreshScheduler"):
+            with patch.object(module, "community_db_path", return_value=db), \
+                    patch.object(module, "RefreshScheduler") as scheduler, \
+                    patch.object(web, "_transport", side_effect=transport), \
+                    patch.object(web.corpus, "robots_delay", return_value=0):
                 skill = module.WingmanWikiLLM()
                 skill.config.prompt = None
                 asyncio.run(skill.prepare())
-                self.assertIn("one short sentence", asyncio.run(skill.get_prompt()))
-                self.assertEqual(json.loads(asyncio.run(skill.wiki_sources("add", "wiki.example.org")))["wiki_count"], 1)
+                prompt = asyncio.run(skill.get_prompt())
+                self.assertIn("one short sentence", prompt)
+                self.assertIn("after they agree", prompt.lower())
+                preview = json.loads(asyncio.run(skill.wiki_sources("preview", "wiki.example.org")))
+                self.assertEqual((preview["status"], preview["source"]["name"]), ("ready", "Game Wiki"))
+                scheduler.return_value.sources_changed.assert_not_called()
+                self.assertEqual(json.loads(asyncio.run(skill.wiki_sources("list")))["sources"], [])
+                added = json.loads(asyncio.run(skill.wiki_sources("add", "wiki.example.org")))
+                self.assertEqual(added["wiki_count"], 1)
+                self.assertTrue(added["automatic_updates"])
+                scheduler.return_value.sources_changed.assert_called_once()
                 self.assertEqual(json.loads(asyncio.run(skill.wiki_sources("pause", "wiki.example.org")))["wiki_count"], 0)
                 reopened = module.WingmanWikiLLM()
                 asyncio.run(reopened.prepare())

@@ -19,11 +19,13 @@ Ask your Wingman about the game while you play. It answers from an offline libra
 
 Ask **“How much of the Galactapedia do we have on board?”** for actual coverage on your computer. A count of titles includes pages the library has yet to save.
 
-## Add another wiki
+## Add a wiki or game API
 
-Paste its **home address** in Wingman chat and say **“Add this wiki to my library.”** You can also paste one address per line in **WikiLLM settings → Other game wikis**. Keep Star Citizen alongside it or switch off **Use the Star Citizen library**.
+Paste the wiki’s home address or the API’s public collection address in Wingman chat and say **“Add this to my library.”** WikiLLM checks the address and starts saving pages in the background. Say **“Check this address first”** to see what it found before adding it. If WikiLLM needs more information, it asks for the missing address or API fields.
 
-Say **“List my extra wikis,” “Pause the Wesnoth wiki,” “Resume the Wesnoth wiki,”** or **“Remove the Wesnoth wiki.”** Pausing stops updates and hides its articles. Removing it also takes it off your list. You can add it back to use its saved pages again. WikiLLM follows nested links, sitemaps and accessible MediaWiki article lists. [Game APIs, full exports and coverage checks](docs/sources.md)
+Say **“List my sources,” “Pause the Wesnoth wiki,” “Resume the Wesnoth wiki,”** or **“Remove the Wesnoth wiki.”** Pausing stops updates and hides its articles. Removing it also takes it off your list. Add it again to use its saved pages. To use only your own sources, switch off **Use the Star Citizen library**.
+
+Say **“How much of this wiki can I read offline?”** Coverage depends on the pages and download permissions the publisher provides. [API examples, offline exports and coverage checks](docs/sources.md)
 
 ## Your field notes
 
