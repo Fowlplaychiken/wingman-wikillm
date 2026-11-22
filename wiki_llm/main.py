@@ -189,6 +189,8 @@ class WingmanWikiLLM(Skill):
             if source == "galactapedia":
                 feed = result["galactapedia_feed"]
                 return json.dumps({"source": "Galactapedia", "total_entries": feed["titles"],
+                                   **({"availability_note": "The publisher has restricted offline article storage."}
+                                      if feed.get("status") == "blocked" else {}),
                                    "english_articles": feed["article_bodies"], "placeholders": feed["placeholders"],
                                    "missing_translations": feed["missing"], "last_success": feed["last_success"],
                                    "reply_guidance": _ANSWER_STYLE})
