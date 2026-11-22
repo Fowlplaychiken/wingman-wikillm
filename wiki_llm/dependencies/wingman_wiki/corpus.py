@@ -248,39 +248,53 @@ class Publisher:
             totalCount edges { node { id title slug } } pageInfo { hasNextPage endCursor }
           }
         }"""
-        cursor, seen, total = None, set(), None
+        cursor, seen, used_cursors = None, set(), set()
+        total, remaining_counts = None, None
         while True:
             body = json.dumps({"query": query, "variables": {"after": cursor}}).encode("utf-8")
             response = json.loads(self._get(url, 1_000_000, body))
             if response.get("errors"):
                 raise ValueError("Galactapedia catalog query failed")
             page = response.get("data", {}).get("allArticle")
-            if not isinstance(page, dict) or type(page.get("totalCount")) is not int:
+            if not isinstance(page, dict) or type(page.get("totalCount")) is not int or page["totalCount"] < 0:
                 raise ValueError("Galactapedia returned no catalog metadata")
-            if total is not None and total != page["totalCount"]:
-                raise ValueError("Galactapedia catalog changed during pagination")
-            total = page["totalCount"]
-            for edge in page.get("edges", []):
-                node = edge.get("node", {})
+            count = page["totalCount"]
+            if total is None:
+                total = count
+            else:
+                # Some catalogs repeat the full count. RSI counts from the current cursor.
+                if remaining_counts is None:
+                    remaining_counts = count != total
+                expected = total - len(seen) if remaining_counts else total
+                if count != expected:
+                    raise ValueError("Galactapedia catalog changed during pagination")
+            edges, info = page.get("edges"), page.get("pageInfo")
+            if not isinstance(edges, list) or not isinstance(info, dict) or type(info.get("hasNextPage")) is not bool:
+                raise ValueError("Galactapedia returned invalid pagination metadata")
+            for edge in edges:
+                node = edge.get("node") if isinstance(edge, dict) else None
+                if not isinstance(node, dict):
+                    raise ValueError("Galactapedia returned an invalid article identity")
                 ident, slug, title = node.get("id", ""), node.get("slug", ""), node.get("title")
                 if (
-                    not re.fullmatch(r"[a-zA-Z0-9]{10}", ident)
-                    or not re.fullmatch(r"[a-zA-Z0-9-]+", slug)
+                    not isinstance(ident, str) or not re.fullmatch(r"[a-zA-Z0-9]{10}", ident)
+                    or not isinstance(slug, str) or not re.fullmatch(r"[a-zA-Z0-9-]+", slug)
                     or not isinstance(title, str)
                     or not title.strip()
                 ):
                     raise ValueError("Galactapedia returned an invalid article identity")
-                if ident not in seen:
-                    seen.add(ident)
-                    yield f"{GALACTAPEDIA}/article/{ident}-{slug}", title
-            info = page.get("pageInfo", {})
-            if not info.get("hasNextPage"):
+                if ident in seen:
+                    raise ValueError("Galactapedia returned a duplicate article identity")
+                seen.add(ident)
+                yield f"{GALACTAPEDIA}/article/{ident}-{slug}", title
+            if not info["hasNextPage"]:
                 if len(seen) != total:
                     raise ValueError(f"incomplete Galactapedia catalog: {len(seen)}/{total}")
                 break
             following = info.get("endCursor")
-            if not following or following == cursor or len(seen) >= total:
+            if not edges or not isinstance(following, str) or not following.strip() or following in used_cursors or len(seen) >= total:
                 raise ValueError("Galactapedia cursor failed to advance")
+            used_cursors.add(following)
             cursor = following
 
 

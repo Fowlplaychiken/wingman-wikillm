@@ -647,15 +647,46 @@ def test_missing_child_sitemap_keeps_previous_catalog(tmp_path):
         assert conn.execute("SELECT count(*) FROM wiki_urls WHERE status='removed'").fetchone() == (0,)
 
 
-def test_changing_galactapedia_total_cannot_commit_mixed_pagination(tmp_path):
+def gala_page(total, ids, cursor=None):
+    return json.dumps({"data": {"allArticle": {"totalCount": total,
+        "edges": [{"node": {"id": f"{n:010d}", "title": f"Ship {n}", "slug": f"ship-{n}"}}
+                  for n in ids],
+        "pageInfo": {"hasNextPage": cursor is not None, "endCursor": cursor}}}})
+
+
+@pytest.mark.parametrize("remaining", [False, True])
+def test_galactapedia_accepts_stable_or_remaining_count(remaining):
     source = corpus.Publisher()
     source.allowed = lambda url: True
-    def page(total, ident, more):
-        return json.dumps({"data": {"allArticle": {"totalCount": total,
-            "edges": [{"node": {"id": ident, "title": "Ship", "slug": "ship"}}],
-            "pageInfo": {"hasNextPage": more, "endCursor": "next" if more else None}}}})
-    with patch.object(source, "_get", side_effect=[page(2, "ABC123def0", True), page(1, "XYZ123abc0", False)]):
-        with pytest.raises(ValueError, match="changed during pagination"):
+    total = 1479
+    pages = [gala_page(total - i if remaining else total, range(i, min(i + 100, total)),
+                       f"after-{i + 100}" if i + 100 < total else None)
+             for i in range(0, total, 100)]
+    with patch.object(source, "_get", side_effect=pages) as get:
+        result = refresh._catalog(source, "galactapedia", None)
+    assert list(result.values()) == [f"Ship {n}" for n in range(total)]
+    assert [json.loads(call.args[2])["variables"]["after"] for call in get.call_args_list] == [
+        None, *(f"after-{n}" for n in range(100, total, 100))]
+
+
+@pytest.mark.parametrize(("pages", "error"), [
+    ([gala_page(3, [0], "a"), gala_page(1, [1, 2])], "changed during pagination"),
+    ([gala_page(4, [0], "a"), gala_page(4, [1], "b"), gala_page(2, [2, 3])], "changed during pagination"),
+    ([gala_page(4, [0], "a"), gala_page(3, [1], "b"), gala_page(4, [2, 3])], "changed during pagination"),
+    ([gala_page(2, [0], "a"), gala_page(1, [0, 1])], "duplicate article identity"),
+    ([gala_page(2, [0, 0, 1])], "duplicate article identity"),
+    ([gala_page(5, [0], "a"), gala_page(4, [1], "b"), gala_page(3, [2], "a")], "cursor failed"),
+    ([gala_page(2, [], "a")], "cursor failed"),
+    ([gala_page(5, [0], "a"), gala_page(4, [1, 2])], "incomplete Galactapedia catalog"),
+    ([gala_page(1, [0], "a")], "cursor failed"),
+    ([gala_page(1, [0, 1])], "incomplete Galactapedia catalog"),
+    ([json.dumps({"data": {"allArticle": {"totalCount": 1, "edges": [], "pageInfo": {}}}})], "invalid pagination"),
+])
+def test_galactapedia_rejects_inconsistent_or_partial_catalog(pages, error):
+    source = corpus.Publisher()
+    source.allowed = lambda url: True
+    with patch.object(source, "_get", side_effect=pages):
+        with pytest.raises(ValueError, match=error):
             refresh._catalog(source, "galactapedia", None)
 
 

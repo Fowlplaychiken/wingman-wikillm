@@ -39,7 +39,9 @@ The September 30, 2023 starter edition contains eligible Star Citizen Wiki contr
 
 ## Galactapedia feed observation (2026-11-22)
 
-The local feed uses the public [Star Citizen Wiki community API](https://api.star-citizen.wiki/developers), not a directly enumerated RSI catalog. A conditional check of all 15 stored API pages returned `304 Not Modified`: pages 1–14 each contain 100 records and page 15 contains 80. The 1,480 API IDs and original URLs are unique. Of those records, 1,479 have English text and one title-only placeholder is **Odin** (`RMNaBDyx6W`); all 1,479 available API bodies are present in the checked local snapshot. This is API feed coverage, not a claim that RSI currently lists exactly 1,480 articles. A separate metadata-only RSI app count returned 1,479, but this check did not enumerate its full ID set and cannot identify any difference between the two inventories. The offline feed preserves the placeholder without inventing article text. Users can add their own field notes offline; those notes remain private, separate from publisher article bodies, and do not fill a missing article.
+On 22 November 2026, WikiLLM followed all 15 pages of RSI’s official article catalog and found **1,479 distinct article IDs**. The local community API edition had English text for **1,478 of those 1,479**. Three article URLs had changed slugs and still matched by ID. **Odin** (`RMNaBDyx6W`) appeared in both catalogs, with only a title in the community feed. [RSI Galactapedia](https://robertsspaceindustries.com/galactapedia) · [Odin](https://robertsspaceindustries.com/galactapedia/article/RMNaBDyx6W-anvil-odin)
+
+The community API supplied 1,480 distinct records, including 1,479 English bodies and the Odin placeholder. Its extra saved body was **Terrence Akari** (`V3qgjK7Jor`), which did not appear in that day’s RSI catalog. A conditional check of all 15 cached community API pages returned HTTP 304. The counts describe this edition and date. Players can keep private field notes alongside the saved articles. [Community API](https://api.star-citizen.wiki/developers)
 
 ### Packaged revision retention check (2026-11-22)
 
