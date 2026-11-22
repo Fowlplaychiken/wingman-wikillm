@@ -6,9 +6,10 @@ Ask your Wingman about the game while you play. It answers from an offline libra
 
 ## Install
 
-1. [Download the latest skill ZIP](https://github.com/Fowlplaychiken/wingman-wikillm/releases/latest). Extract the **wiki_llm** folder into `%APPDATA%\ShipBit\WingmanAI\custom_skills`.
-2. Reopen Wingman and enable **WikiLLM** on your assistant. Star Citizen is selected by default.
-3. Ask **“Why’s it so hard to see on Aberdeen?”** The starter guides are ready immediately. Other articles arrive while Wingman runs.
+1. Quit Wingman. On the release page, open **Assets** and download the ZIP that starts with `wiki_llm-`. [Latest release](https://github.com/Fowlplaychiken/wingman-wikillm/releases/latest)
+2. Press **Win+R**, paste `%APPDATA%\ShipBit\WingmanAI\custom_skills`, and press **Enter**. If `custom_skills` is missing, create it in the `WingmanAI` folder.
+3. Extract the ZIP, then copy the **wiki_llm** folder into `custom_skills`. The file `main.py` should be directly inside `custom_skills\wiki_llm`.
+4. Open Wingman and enable **WikiLLM** in your assistant’s skills. Ask **“Why’s it so hard to see on Aberdeen?”** The Star Citizen starter guides are ready immediately. More articles arrive while Wingman runs.
 
 ## What’s on board?
 
@@ -35,4 +36,4 @@ Say **“How much of this wiki can I read offline?”** Coverage depends on the 
 
 With **Automatically draft game notes** on, Wingman can draft notes from concrete observations you share. Turn it off to save only when you ask. Notes stay in your local library. A hosted Wingman model can receive the notes it uses in an answer.
 
-To back up, close Wingman and copy `.starcitizen-wiki` from your user folder. To upgrade, replace the skill folder with the latest ZIP. [Community article license and attribution](docs/sources.md#community-archive)
+To upgrade, quit Wingman and replace the old **wiki_llm** folder with the new one from the ZIP. Your library and notes live in `%USERPROFILE%\.starcitizen-wiki`. Copy that folder to back them up. [Community article license and attribution](docs/sources.md#community-archive)
