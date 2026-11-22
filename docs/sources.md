@@ -16,6 +16,8 @@ In chat, you can give Wingman the collection address and tell it which fields co
 
 `items` identifies the record list. `title` and `text` identify fields in each record. Use `url_field` for its original link or construct a citation from a stable ID as shown. For pagination, WikiLLM follows a same-site next-page URL in the JSON or an HTTP Link header. A declared total lets it detect missing entries.
 
+If the API returns a cursor instead of a URL, name the response field and the request parameter. For example, `"next":"nextPageToken","next_param":"pageToken"` passes a returned token into the next request while retaining your filters. For an API that returns the next page number, use its field and parameter, such as `"next":"next_page","next_param":"page"`. [Example of cursor pagination](https://developers.google.com/ad-manager/api/beta/pagination)
+
 The example saved all six advertised articles in an isolated test. The offline reader returned their original links. Pausing hid them and resuming restored them. The unchanged check sent the publisher's validator and received HTTP 304. [Open5e collection](https://api.open5e.com/v2/conditions/?document__key=a5e-ag)
 
 ```shell

@@ -1,7 +1,9 @@
 """Bounded offline tests for public JSON API snapshots."""
+import hashlib
 import json
 import sqlite3
 from unittest.mock import patch
+from urllib.parse import parse_qsl, urlsplit
 
 import pytest
 
@@ -80,6 +82,79 @@ def test_mapping_supports_dotted_array_indices_and_default_aliases():
     assert default.items == "results|items|data|records|entries"
     assert feeds._normalized({"name": "Ice", "description": ["First.", "Second."],
                               "link": ARTICLE_A}, default)["text"] == "First.\nSecond."
+
+
+def test_unset_next_param_preserves_legacy_mapping_digest():
+    feed = feeds.JsonFeed(API)
+    legacy_fields = {"url", "items", "title", "text", "url_field", "next", "total",
+                     "url_template", "id_field"}
+    legacy_value = {name: getattr(feed, name) for name in legacy_fields}
+    expected = hashlib.sha256(json.dumps(legacy_value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+    assert feed.mapping_sha256 == expected
+    assert feeds.parse_feeds(API)[0].mapping_sha256 == expected
+    configured = feeds.parse_feeds(json.dumps({"url": API, "next_param": None}))[0]
+    assert configured.mapping_sha256 == expected
+    cursor_feed = feeds.parse_feeds(json.dumps({"url": API, "next": "next_cursor",
+                                                "next_param": "cursor"}))[0]
+    assert cursor_feed.mapping_sha256 != expected
+
+
+def test_cursor_token_builds_same_origin_url_and_changes_only_its_parameter():
+    base = API + "?document__key=a5e-ag&cursor=stale&limit=10&filter=some%2Fvalue&cursor=duplicate"
+    feed = feeds.parse_feeds(json.dumps({"url": base, "next": "pageInfo.endCursor",
+                                         "next_param": "cursor"}))[0]
+    token = "https://evil.example/path?api_key=dummy&x=1"
+    response = web_sources.Response(200, {}, b"")
+
+    result = feeds._extract_next({"pageInfo": {"endCursor": token}}, feed, base, response, None)
+
+    parts = urlsplit(result)
+    assert parts.scheme == "https" and parts.netloc == "api.open5e.com"
+    assert parts.query == (
+        "document__key=a5e-ag&limit=10&filter=some%2Fvalue&cursor="
+        "https%3A%2F%2Fevil.example%2Fpath%3Fapi_key%3Ddummy%26x%3D1"
+    )
+    assert parse_qsl(parts.query, keep_blank_values=True) == [
+        ("document__key", "a5e-ag"), ("limit", "10"), ("filter", "some/value"), ("cursor", token)
+    ]
+
+
+def test_integer_next_page_uses_the_configured_query_parameter():
+    base = API + "?document__key=a5e-ag&limit=10"
+    feed = feeds.parse_feeds(json.dumps({"url": base, "next": "pagination.nextPage",
+                                         "next_param": "page"}))[0]
+    response = web_sources.Response(200, {}, b"")
+
+    result = feeds._extract_next({"pagination": {"nextPage": 2}}, feed, base, response, None)
+
+    assert result == base + "&page=2"
+
+
+@pytest.mark.parametrize("value", [None, "", False])
+def test_empty_cursor_is_terminal_or_uses_existing_link_header(value):
+    base = API + "?limit=10"
+    feed = feeds.parse_feeds(json.dumps({"url": base, "next": "next_cursor",
+                                         "next_param": "cursor"}))[0]
+    no_link = web_sources.Response(200, {}, b"")
+    assert feeds._extract_next({"next_cursor": value}, feed, base, no_link, None) is None
+
+    with_link = web_sources.Response(200, {"link": '<?page=1>; rel="prev", <?page=2>; rel="next"'}, b"")
+    assert feeds._extract_next({"next_cursor": value}, feed, base, with_link, None) == API + "?page=2"
+
+
+@pytest.mark.parametrize("value", [True, 1.5, [], {}])
+def test_cursor_mapping_rejects_non_scalar_values(value):
+    feed = feeds.parse_feeds(json.dumps({"url": API, "next": "next_cursor",
+                                         "next_param": "cursor"}))[0]
+    with pytest.raises(ValueError, match="token or integer"):
+        feeds._extract_next({"next_cursor": value}, feed, API, web_sources.Response(200, {}, b""), None)
+
+
+@pytest.mark.parametrize("name", ["", "cursor&api_key", "cursor=value", "cursor/value", "cursor%2F"])
+def test_next_param_must_be_a_simple_query_parameter_name(name):
+    with pytest.raises(ValueError, match="simple query parameter name"):
+        feeds.parse_feeds(json.dumps({"url": API, "next": "next_cursor", "next_param": name}))
 
 
 def test_refresh_publishes_complete_feed_and_reuses_each_page_validator(tmp_path, monkeypatch):
@@ -213,3 +288,57 @@ def test_http_link_pagination_survives_conditional_refresh(tmp_path, monkeypatch
         result = feeds.refresh_feeds(db, (feed,), clock=lambda: now)
         assert result[feed.url]["articles"] == 2
     assert checked == [API, later, API, later]
+
+
+def test_json_cursor_pagination_survives_conditional_refresh(tmp_path, monkeypatch):
+    base = API + "?document__key=a5e-ag&limit=1"
+    token = "opaque+&/=?"
+    later = API + "?document__key=a5e-ag&limit=1&cursor=opaque%2B%26%2F%3D%3F"
+    first = {"count": 2, "next_cursor": token,
+             "results": [_item("Cold", "cold", "Cold imposes a slowing effect.")]}
+    second = {"count": 2, "next_cursor": "",
+              "results": [_item("Fear", "fear", "Fear can disrupt concentration.")]}
+    responses = {base: first, later: second}
+    checked = []
+
+    def transport(url, headers, *, validate_url):
+        validate_url(url)
+        if url.endswith("/robots.txt"):
+            return web_sources.Response(404, {}, b"")
+        assert url in responses
+        checked.append((url, dict(headers)))
+        validator = "etag:" + url
+        if headers.get("If-None-Match") == validator:
+            return web_sources.Response(304, {"ETag": validator}, b"")
+        return web_sources.Response(200, {"Content-Type": "application/json", "ETag": validator},
+                                    json.dumps(responses[url]).encode())
+
+    monkeypatch.setattr(web_sources, "_transport", transport)
+    feed = feeds.parse_feeds(json.dumps({
+        "url": base,
+        "items": "results",
+        "title": "name",
+        "text": "desc.0.desc",
+        "url_template": "https://www.open5e.com/conditions/{id}/",
+        "id_field": "slug",
+        "next": "next_cursor",
+        "next_param": "cursor",
+        "total": "count",
+    }))[0]
+    db = tmp_path / "wiki.sqlite3"
+
+    first_run = feeds.refresh_feeds(db, (feed,), clock=lambda: 1_800_000_000.0)
+    assert first_run[feed.url]["status"] == "ready"
+    assert first_run[feed.url]["articles"] == 2
+    with sqlite3.connect(db) as state_db:
+        state_db.execute("UPDATE json_feed_state SET next_attempt=0 WHERE url=?", (feed.url,))
+    second_run = feeds.refresh_feeds(db, (feed,), clock=lambda: 1_800_000_001.0)
+
+    assert second_run[feed.url]["status"] == "ready"
+    assert second_run[feed.url]["articles"] == 2
+    assert [url for url, _ in checked] == [base, later, base, later]
+    assert [headers.get("If-None-Match") for _, headers in checked] == [
+        None, None, "etag:" + base, "etag:" + later
+    ]
+    result = read_snapshot_page(feeds.feed_db_path(db, feed), ARTICLE_A)
+    assert result["status"] == "snapshot" and result["text"] == "Cold imposes a slowing effect."
