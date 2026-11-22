@@ -640,13 +640,19 @@ class MediaWikiAPI(Fixture):
         super().__init__()
         self.batches = list(batches)
         self.api_calls = []
+        self.route_calls = []
+        self.general = {"scriptpath": "", "articlepath": "/wiki/$1"}
         self.pages[root] = html('Declared wiki', extra='<link rel="EditURI" type="application/rsd+xml" href="/api.php?action=rsd">')
 
     def __call__(self, url, headers):
         from urllib.parse import parse_qs, urlsplit
         if urlsplit(url).path == '/api.php':
             self.calls.append((url, headers))
-            self.api_calls.append(parse_qs(urlsplit(url).query))
+            fields = parse_qs(urlsplit(url).query)
+            if fields == {"action": ["query"], "format": ["json"], "meta": ["siteinfo"], "siprop": ["general"]}:
+                self.route_calls.append(url)
+                return web.Response(200, {}, json.dumps({"query": {"general": self.general}}).encode())
+            self.api_calls.append(fields)
             value = self.batches.pop(0)
             return value if isinstance(value, web.Response) else web.Response(200, {}, __import__('json').dumps(value).encode())
         return super().__call__(url, headers)
@@ -677,10 +683,12 @@ def test_declared_mediawiki_api_enumerates_orphans_across_persisted_batches(tmp_
 
 def test_mediawiki_api_robots_refusal_and_off_origin_declarations_never_contact(tmp_path):
     source, db = MediaWikiAPI(A, []), tmp_path / 'wiki.sqlite3'
-    # This endpoint is outside the /game-a/ family and must not be registered.
+    # The declared endpoint describes /wiki/, outside /game-a/. Ask only for
+    # its route metadata; it cannot supply an article inventory for game A.
     source.run(db)
-    source.run(db)
-    assert source.api_calls == []
+    result = source.run(db)
+    assert len(source.route_calls) == 1 and source.api_calls == []
+    assert result['roots'][A]['api']['reason'] == 'publisher_article_path_unverified'
     root = 'https://wiki.example/wiki/Main_Page'
     db = tmp_path / 'robots.sqlite3'
     source = MediaWikiAPI(root, [])
