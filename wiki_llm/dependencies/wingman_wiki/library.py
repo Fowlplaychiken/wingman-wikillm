@@ -26,7 +26,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS current_notes USING fts5(
 
 
 def record_note(slug, title, finding, *, status, source=None, game_build=None,
-                previous_revision=0, db_path=None):
+                previous_revision=0, db_path=None, automatic=False):
     """Append one revision. Parallel changes cannot overwrite one another."""
     if not isinstance(slug, str) or not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", slug) or len(slug) > 100:
         raise ValueError("Use a short topic ID such as aberdeen-visibility.")
@@ -50,13 +50,27 @@ def record_note(slug, title, finding, *, status, source=None, game_build=None,
     with closing(sqlite3.connect(db_path)) as db, db:
         db.executescript(_SCHEMA)
         db.execute("BEGIN IMMEDIATE")
-        current = db.execute("SELECT coalesce(max(revision),0) FROM note_revisions WHERE slug=?", (slug,)).fetchone()[0]
+        latest = db.execute("""SELECT revision,title,finding,source,game_build,status
+            FROM note_revisions WHERE slug=? ORDER BY revision DESC LIMIT 1""", (slug,)).fetchone()
+        current = latest[0] if latest else 0
+        content = (title.strip(), finding.strip(), source or None, game_build or None, status)
+        if latest and latest[1:] == content and (
+            previous_revision == current - 1 or (status == "draft" and previous_revision == current)
+        ):
+            return {"topic": slug, "revision": current, "status": status, "unchanged": True}
         if current != previous_revision:
             raise ValueError(f"This topic is at revision {current}. Read its history before editing.")
+        if automatic and not current:
+            existing = db.execute("""SELECT n.slug FROM note_revisions n
+                WHERE lower(trim(n.title))=? AND n.revision=(
+                    SELECT max(r.revision) FROM note_revisions r WHERE r.slug=n.slug
+                ) ORDER BY n.slug LIMIT 1""", (content[0].lower(),)).fetchone()
+            if existing:
+                raise ValueError(f"Topic {existing[0]} already uses that title. Read its history before creating a topic.")
         revision = current + 1
         db.execute("INSERT INTO note_revisions VALUES(?,?,?,?,?,?,?,?)", (
             slug, revision, datetime.now(timezone.utc).isoformat(timespec="microseconds"),
-            title.strip(), finding.strip(), source or None, game_build or None, status))
+            *content))
         if status != "draft":
             db.execute("DELETE FROM current_notes WHERE slug=?", (slug,))
             if status == "reviewed":
@@ -73,6 +87,25 @@ def _read(db_path, sql, args, table):
         if not db.execute("SELECT 1 FROM sqlite_master WHERE name=?", (table,)).fetchone():
             return []
         return [dict(row) for row in db.execute(sql, args)]
+
+
+def note_topics(query, db_path=None):
+    """Find existing private topic IDs, including drafts, before proposing an edit."""
+    terms = _query_terms(query)[:8]
+    if not terms:
+        return []
+    title = " ".join(query.lower().split())
+    slug = re.sub(r"[^a-z0-9]+", "-", title).strip("-")
+    match = " + ".join("(instr(lower(n.title || ' ' || n.slug), ?) > 0)" for _ in terms)
+    return _read(db_path, f"""WITH matches AS (
+        SELECT n.slug,n.title,n.revision,n.status,n.game_build,
+               (n.slug=? OR lower(n.title)=?) AS exact, {match} AS hits
+        FROM note_revisions n WHERE n.revision=(
+            SELECT max(r.revision) FROM note_revisions r WHERE r.slug=n.slug
+        )
+    ) SELECT slug,title,revision,status,game_build,exact FROM matches
+      WHERE exact OR (hits>0 AND status!='withdrawn')
+      ORDER BY exact DESC,hits DESC,slug LIMIT 6""", (slug, title, *terms), "note_revisions")
 
 
 def note_history(slug, db_path=None, before=None):

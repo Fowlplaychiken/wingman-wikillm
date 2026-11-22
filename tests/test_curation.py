@@ -153,6 +153,26 @@ class CurationTests:
         prompt = asyncio.run(skill.get_prompt())
         assert "Automatic private drafts are disabled" in prompt
 
+    def test_automatic_note_guards_and_topic_tool(self):
+        module = _load_main_module()
+        skill = module.WingmanWikiLLM()
+        def save(status):
+            return json.loads(asyncio.run(skill.wiki_note("survey-ships", "Survey ships",
+                "The player observed a sensor issue.", status, automatic=True)))
+
+        with patch.object(module, "record_note", return_value={"status": "draft"}) as record:
+            assert save("draft")["status"] == "not_saved"
+            skill.properties["auto_curation"] = True
+            assert save("reviewed")["status"] == "not_saved"
+            assert save("withdrawn")["status"] == "not_saved"
+            record.assert_not_called()
+            assert save("draft")["status"] == "draft"
+            record.assert_called_once()
+        result = [{"slug": "survey-ships", "revision": 1, "status": "draft"}]
+        with patch.object(module, "note_topics", return_value=result) as topics:
+            assert json.loads(asyncio.run(skill.wiki_note_topics("survey ships"))) == result
+            topics.assert_called_once_with("survey ships")
+
     def test_standard_record_note_tool_remains_the_only_write_path(self):
         module = _load_main_module()
         skill = module.WingmanWikiLLM()

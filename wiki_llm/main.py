@@ -5,7 +5,9 @@ from pathlib import Path
 from typing import Literal, Optional
 
 from skills.skill_base import Skill, tool
-from wingman_wiki.library import library_status, lookup, note_history, read_page, record_note, review_queue
+from wingman_wiki.library import (
+    library_status, lookup, note_history, note_topics, read_page, record_note, review_queue,
+)
 from wingman_wiki.json_feeds import parse_feeds
 from wingman_wiki.reference import community_db_path
 from wingman_wiki.refresh import RefreshScheduler
@@ -52,8 +54,11 @@ class WingmanWikiLLM(Skill):
                 "evidence. A retrieved wiki article by itself is never evidence for "
                 "a private note; do not copy article text into notes. Save automatic "
                 "candidates as drafts, never reviewed. Exclude secrets and unrelated "
-                "personal details. Search the review queue by topic and look up existing reviewed notes before creating another entry. "
-                "For a correction, reuse the topic ID, read its history and append the new revision. "
+                "personal details. Before writing, use wikillm_note_topics with a short game and subject name. "
+                "For the same subject, read its history, reuse the topic ID and append one revision. "
+                "Create a topic only for a distinct subject. Do not merge merely similar topics. Keep different "
+                "locations, game builds and conditions explicit, and leave conflicting evidence as a draft. "
+                "Use automatic=true for observations the player did not explicitly ask you to save. "
                 "Attach a relevant original article link when established. A player's later independent confirmation "
                 "of a draft can review it in the same conversation; a repeated assistant answer cannot. "
                 "Keep the spoken reply focused on what the player asked."
@@ -61,7 +66,7 @@ class WingmanWikiLLM(Skill):
         else:
             curation = (
                 "Automatic private drafts are disabled. Use wikillm_record_note only "
-                "when the player explicitly asks to save, correct, or withdraw a note. "
+                "when the player explicitly asks to save, correct, or withdraw a note. Find its topic before changing it. "
                 "A retrieved wiki article by itself is never evidence for a private note."
             )
         return "\n\n".join(part for part in (prompt, _ANSWER_STYLE, _SOURCE_SETUP, curation) if part)
@@ -213,7 +218,7 @@ class WingmanWikiLLM(Skill):
     async def wiki_note(self, slug: str, title: str, finding: str,
                         status: Literal["draft", "reviewed", "withdrawn"],
                         source: Optional[str] = None, game_build: Optional[str] = None,
-                        previous_revision: int = 0) -> str:
+                        previous_revision: int = 0, automatic: bool = False) -> str:
         """Maintain local notes with a revision trail.
 
         Args:
@@ -224,14 +229,26 @@ class WingmanWikiLLM(Skill):
             source: Original public evidence URL. Omit for local observations.
             game_build: Observed build, if known.
             previous_revision: Latest revision of this note, or zero for a new topic.
+            automatic: True for an unsolicited player observation. It can only become a draft.
         """
+        if automatic and (status != "draft" or not self._auto_curation_enabled()):
+            return json.dumps({"status": "not_saved", "reason": "Automatic curation only saves enabled drafts."})
         try:
             result = await asyncio.to_thread(record_note, slug, title, finding, status=status,
                                              source=source, game_build=game_build,
-                                             previous_revision=previous_revision)
+                                             previous_revision=previous_revision, automatic=automatic)
         except ValueError as error:
             result = {"status": "not_saved", "reason": str(error)}
         return json.dumps(result)
+
+    @tool(name="wikillm_note_topics", description="Find an existing private note topic by game and subject before creating or correcting a note. Includes drafts. A related match is a suggestion. Read its history before choosing to reuse it.", summarize=False)
+    async def wiki_note_topics(self, topic: str) -> str:
+        """Find private topic IDs and their latest revisions.
+
+        Args:
+            topic: A short game and subject name, note title, or known topic ID.
+        """
+        return json.dumps(await asyncio.to_thread(note_topics, topic), ensure_ascii=False)
 
     @tool(name="wikillm_note_history", description="Read local note revisions, including open drafts, corrections and withdrawals, before editing.", summarize=False)
     async def wiki_note_history(self, slug: str, before: Optional[int] = None) -> str:
