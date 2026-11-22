@@ -104,8 +104,9 @@ def note_topics(query, db_path=None):
             SELECT max(r.revision) FROM note_revisions r WHERE r.slug=n.slug
         )
     ) SELECT slug,title,revision,status,game_build,exact FROM matches
-      WHERE exact OR (hits>0 AND status!='withdrawn')
-      ORDER BY exact DESC,hits DESC,slug LIMIT 6""", (slug, title, *terms), "note_revisions")
+      WHERE exact OR (hits>=? AND status!='withdrawn')
+      ORDER BY exact DESC,hits DESC,slug LIMIT 6""",
+                 (slug, title, *terms, min(2, len(terms))), "note_revisions")
 
 
 def note_history(slug, db_path=None, before=None):

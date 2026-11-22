@@ -1,7 +1,7 @@
 module: skills.wiki_llm.main
 name: WingmanWikiLLM
 api_version: 3
-version: 0.3.11
+version: 0.3.12
 display_name: WikiLLM
 author: Wingman WikiLLM contributors
 description:
