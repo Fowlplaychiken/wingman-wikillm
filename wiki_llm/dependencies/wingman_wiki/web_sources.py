@@ -69,6 +69,7 @@ _LICENSE = re.compile(r"^https?://(?:www\.)?creativecommons\.org/(?:licenses/(by
 _ALLPAGES = {"action": "query", "format": "json", "list": "allpages", "apnamespace": "0",
              "aplimit": "50", "apfilterredir": "nonredirects"}
 _NAMESPACE_INFO = {"meta": "siteinfo", "siprop": "namespaces"}
+_SITE_ROUTES = {"action": "query", "format": "json", "meta": "siteinfo", "siprop": "general"}
 _SITEMAP_ACCEPT = "application/xml, text/xml, application/gzip"
 
 
@@ -202,6 +203,9 @@ def _network_url(url):
         base = _url(urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", "")), mediawiki_endpoint=True)
         pairs = parse_qsl(parsed.query, keep_blank_values=True, strict_parsing=True)
         fields = dict(pairs)
+        if (parsed.path.endswith("/api.php") and len(url) <= 6000
+                and len(pairs) == len(fields) and fields == _SITE_ROUTES):
+            return base + "?" + urlencode(fields)
         namespace = fields.get("apnamespace", "")
         metadata = {k: fields[k] for k in _NAMESPACE_INFO if k in fields}
         if (len(url) > 6000 or not parsed.path.endswith("/api.php") or len(fields) != len(pairs)
@@ -226,38 +230,68 @@ def _sitemap_url(url):
 
 
 def _api_endpoint(root, edit_uri):
-    """Accept only a publisher-declared MediaWiki EditURI in this wiki family."""
+    """Accept an explicitly declared same-origin MediaWiki discovery endpoint."""
     try:
         parsed = urlsplit(urljoin(root, edit_uri))
         endpoint = _url(urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", "")), mediawiki_endpoint=True)
         fields = parse_qsl(parsed.query, keep_blank_values=True, strict_parsing=True)
     except ValueError:
         return None
-    family = _scope(root)
-    if family.endswith("/wiki/"):
-        family = family[:-5]
-    elif family.endswith("/w/"):
-        family = family[:-2]
     if (urlsplit(endpoint).netloc != urlsplit(root).netloc or not parsed.path.endswith("/api.php")
-            or not parsed.path.startswith(family) or fields not in ([], [("action", "rsd")])
+            or fields not in ([], [("action", "rsd")])
             or _admin_endpoint(parsed.path.rsplit("/", 1)[0])):
         return None
     return endpoint
 
 
+def _standard_api_family(root, endpoint):
+    family = _scope(root)
+    if family.endswith("/wiki/"):
+        family = family[:-5]
+    elif family.endswith("/w/"):
+        family = family[:-2]
+    return urlsplit(endpoint).path.startswith(family)
+
+
+def _publisher_article_prefix(root, endpoint, general):
+    """Bind a custom short-URL directory to the configured wiki before listing any titles."""
+    if not isinstance(general, dict):
+        return None
+    path = general.get("articlepath")
+    if (not isinstance(path, str) or not path.startswith("/") or path.startswith("//")
+            or not path.endswith("/$1") or path.count("$1") != 1 or "?" in path or "#" in path):
+        return None
+    try:
+        origin = urlsplit(root)
+        base = _url(urlunsplit((origin.scheme, origin.netloc, path[:-2], "", "")))
+        server = general.get("server")
+        if server is not None and (not isinstance(server, str) or not server.startswith(("https://", "//"))
+                or urlsplit(_url(urljoin(root, server))).netloc != origin.netloc):
+            return None
+        scriptpath = general.get("scriptpath")
+        if scriptpath is not None and scriptpath != urlsplit(endpoint).path.rsplit("/", 1)[0]:
+            return None
+    except ValueError:
+        return None
+    return base if _scope(root).startswith(urlsplit(base).path) else None
+
+
 def _register_api(db, root, edit_uri):
-    endpoint = _api_endpoint(root, edit_uri)
-    if endpoint:
-        previous = db.execute("SELECT url FROM web_apis WHERE root=?", (root,)).fetchone()
-        if previous and previous[0] != endpoint:
-            db.execute("DELETE FROM web_api_cursors WHERE root=?", (root,))
-            db.execute("DELETE FROM web_apis WHERE root=?", (root,))
-        db.execute("INSERT OR IGNORE INTO web_apis(root,url) VALUES(?,?)", (root, endpoint))
+    # Record a rejected declaration without retaining an untrusted URL.
+    endpoint = _api_endpoint(root, edit_uri) or ""
+    previous = db.execute("SELECT url FROM web_apis WHERE root=?", (root,)).fetchone()
+    if previous and previous[0] != endpoint:
+        db.execute("DELETE FROM web_api_cursors WHERE root=?", (root,))
+        db.execute("DELETE FROM web_apis WHERE root=?", (root,))
+    db.execute("INSERT OR IGNORE INTO web_apis(root,url,last_error) VALUES(?,?,?)",
+               (root, endpoint, None if endpoint else "api_declaration_unsupported"))
 
 
-def _title_url(root, title, endpoint=None):
+def _title_url(root, title, endpoint=None, article_prefix=None):
     origin = urlsplit(root)
-    if origin.query or (endpoint and origin.path.endswith("/")):
+    if article_prefix:
+        candidate = article_prefix + quote(title.replace(" ", "_"), safe=":/")
+    elif origin.query or (endpoint and origin.path.endswith("/")):
         path = origin.path if origin.query else urlsplit(urljoin(endpoint, "index.php")).path
         candidate = urlunsplit((origin.scheme, origin.netloc, path,
                                urlencode({"title": title.replace(" ", "_")}, quote_via=quote, safe=":/"), ""))
@@ -296,27 +330,61 @@ def _page_key(namespace, token):
     return (f"{namespace}:" if namespace else "") + (json.dumps(token, sort_keys=True) if token else "")
 
 
+def _api_query(db, contact, request, rules):
+    response = contact.get(_network_url(request), rules=rules)
+    if response.status != 200:
+        raise ValueError("Declared wiki API unavailable")
+    data = json.loads(_payload(response, 1_000_000).decode("utf-8-sig"))
+    error = data.get("error")
+    if isinstance(error, dict) and error.get("code") in ("ratelimited", "maxlag"):
+        until = corpus.retry_after(response.headers.get("retry-after", "900"), contact.clock())
+        with db:
+            db.execute("UPDATE web_hosts SET blocked_until=max(blocked_until,?) WHERE host=?",
+                       (until, urlsplit(request).netloc))
+        raise _Cooldown(until)
+    if error or not isinstance(data.get("query"), dict):
+        raise ValueError("Incomplete wiki API response")
+    return data
+
+
 def _enumerate_api(db, contact, root, rules):
     """One metadata-only allpages batch; publisher continuation persists across cycles.
 
     Protocol: https://www.mediawiki.org/wiki/API:Allpages and API:Continue.
     Article bodies still use the normal per-page robots/licence/storage gates.
     """
-    row = db.execute("SELECT url,cursor,next_attempt FROM web_apis WHERE root=?", (root,)).fetchone()
-    if not row or row[2] > contact.clock():
-        return {"state": "not_due" if row else "not_declared"}
-    endpoint, cursor, _ = row
+    row = db.execute("SELECT url,cursor,next_attempt,article_prefix,last_error FROM web_apis WHERE root=?", (root,)).fetchone()
+    if not row:
+        return {"state": "not_declared"}
+    endpoint, cursor, due, article_prefix, previous_error = row
+    if not endpoint:
+        return {"state": "blocked", "complete": False, "reason": "api_declaration_unsupported"}
+    if due > contact.clock():
+        return {"state": "not_due", **({"complete": False, "reason": previous_error} if previous_error else {})}
     if _api_endpoint(root, endpoint) != endpoint:
         raise ValueError("Stored wiki API endpoint is outside this wiki family")
     saved = json.loads(cursor) if cursor else {}
     discover = "remaining" not in saved
+    if not _standard_api_family(root, endpoint) and (discover or not article_prefix):
+        request = endpoint + "?" + urlencode(_SITE_ROUTES)
+        blocked_reason = "article_path_metadata_robots_disallowed"
+        if _allowed(rules, request):
+            general = _api_query(db, contact, request, rules)["query"].get("general")
+            article_prefix = _publisher_article_prefix(root, endpoint, general)
+            blocked_reason = None if article_prefix else "publisher_article_path_unverified"
+        if blocked_reason:
+            with db:
+                db.execute("UPDATE web_apis SET article_prefix=NULL,last_error=?,next_attempt=? WHERE root=?",
+                           (blocked_reason, contact.clock()+86_400, root))
+            return {"state": "blocked", "complete": False, "reason": blocked_reason}
+        with db:
+            db.execute("UPDATE web_apis SET article_prefix=? WHERE root=?", (article_prefix, root))
     remaining = [0] if discover else saved["remaining"]
     reason = None if discover else saved["reason"]
     continuation = _api_continuation((saved if discover else saved["after"]) or None)
     namespace = remaining[0]
     query = {**_ALLPAGES, "apnamespace": str(namespace), **(continuation or {})}
     request = endpoint + "?" + urlencode(query)
-    _network_url(request)
     if not _allowed(rules, request):
         reason = "robots_disallowed"
         # A host-wide refusal, or the last blocked namespace, can resume from
@@ -330,22 +398,12 @@ def _enumerate_api(db, contact, root, rules):
     if discover:
         combined = endpoint + "?" + urlencode({**query, **_NAMESPACE_INFO})
         if _allowed(rules, combined):
-            request = _network_url(combined)
+            request = combined
         else:
             reason = "namespace_metadata_robots_disallowed"
-    response = contact.get(request, rules=rules)
-    if response.status != 200:
-        raise ValueError("Declared wiki API unavailable")
-    data = json.loads(_payload(response, 1_000_000).decode("utf-8-sig"))
-    error = data.get("error")
-    if isinstance(error, dict) and error.get("code") in ("ratelimited", "maxlag"):
-        until = corpus.retry_after(response.headers.get("retry-after", "900"), contact.clock())
-        with db:
-            db.execute("UPDATE web_hosts SET blocked_until=max(blocked_until,?) WHERE host=?",
-                       (until, urlsplit(endpoint).netloc))
-        raise _Cooldown(until)
-    pages = data.get("query", {}).get("allpages")
-    if data.get("error") or not isinstance(pages, list) or len(pages) > 50:
+    data = _api_query(db, contact, request, rules)
+    pages = data["query"].get("allpages")
+    if not isinstance(pages, list) or len(pages) > 50:
         raise ValueError("Incomplete wiki allpages batch")
     if discover and reason is None:
         declared = _namespace_ids(data["query"].get("namespaces"))
@@ -359,7 +417,7 @@ def _enumerate_api(db, contact, root, rules):
                 or type(page.get("pageid")) is not int or page["pageid"] <= 0
                 or not isinstance(page.get("title"), str) or not page["title"].strip()):
             raise ValueError("Invalid wiki allpages article identity")
-        target = _title_url(root, page["title"], endpoint)
+        target = _title_url(root, page["title"], endpoint, article_prefix)
         if target:
             targets.append(target)
     following = _api_continuation(data.get("continue"))
@@ -1034,6 +1092,18 @@ def refresh_web_sources(db_path, roots, *, batch_size=5, stop_event=None,
                 # Older versions retained the article text but discarded navigation.
                 # Revisit the home page first. Other pages use the normal paced queue.
                 db.execute("UPDATE web_pages SET next_attempt=0 WHERE root=url AND status='indexed' AND last_error IS NULL")
+        if "article_prefix" not in {r[1] for r in db.execute("PRAGMA table_info(web_apis)")}:
+            with db:
+                db.execute("ALTER TABLE web_apis ADD COLUMN article_prefix TEXT")
+                # 0.3.4 silently discarded custom-path declarations. Re-read just
+                # the landing page or its saved redirect target to discover them.
+                db.execute("""WITH RECURSIVE landing(root,url) AS (
+                    SELECT root,root FROM web_roots WHERE root NOT IN (SELECT root FROM web_apis)
+                    UNION SELECT p.root,p.redirect_url FROM landing
+                    JOIN web_pages p ON p.root=landing.root AND p.url=landing.url
+                    WHERE p.redirect_url IS NOT NULL)
+                    UPDATE web_pages SET links_scanned=0,next_attempt=0 WHERE status='indexed'
+                    AND (root,url) IN (SELECT root,url FROM landing)""")
         contact = _Contact(db, _transport or globals()["_transport"], _clock, stop_event)
         last = db.execute("SELECT last_root FROM web_cursor WHERE id=1").fetchone()
         start = (roots.index(last[0])+1) % len(roots) if last and last[0] in roots else 0
@@ -1296,7 +1366,9 @@ def refresh_web_sources(db_path, roots, *, batch_size=5, stop_event=None,
             if not progressed:
                 break
     for item in report["roots"].values():
-        if (item.get("discovery_error") or item.get("sitemaps_pending")) and item["state"] == "ready":
+        api = item.get("api", {})
+        if item["state"] == "ready" and (item.get("discovery_error") or item.get("sitemaps_pending")
+                or api.get("complete") is False or api.get("state") == "failed"):
             item["state"] = "partial"
     report["coverage"] = web_coverage(db_path, roots)
     return report

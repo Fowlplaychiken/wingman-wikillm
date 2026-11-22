@@ -1,6 +1,7 @@
 """One publisher's unlinked, namespaced game articles through the normal refresh path."""
 import json
 import sqlite3
+from urllib.parse import quote
 
 import pytest
 
@@ -108,3 +109,103 @@ def test_legacy_cursor_and_publisher_rate_limit_resume_same_custom_namespace(tmp
     result = source.run(db, (ROOT,))["roots"][ROOT]["api"]
     assert result["state"] == "advanced" and result["namespace"] == 100
     assert [c["apnamespace"] for c in source.api_calls] == [["0"], ["100"], ["100"]]
+
+
+@pytest.mark.parametrize("entry", ["Hauptseite", ""])
+def test_custom_article_path_reads_unlinked_localized_subpages_and_resumes(tmp_path, entry):
+    base = "https://wiki.example/artikel/"
+    root, db = base + entry, tmp_path / "wiki.sqlite3"
+    names = ["Flughandbuch", "Gegenstand:Gerät/Teil A", "Gegenstand:Gerät/Teil B/Kern"]
+    namespaces = {"0": NAMESPACES["0"], "100": {"id": 100, "*": "Gegenstand", "content": ""}}
+    source = MediaWikiAPI(root, [batch(0, names[0], namespaces=namespaces),
+                                 batch(100, names[1], following="Teil B"), batch(100, names[2])])
+    source.general.update(articlepath="/artikel/$1", server="//wiki.example")
+    articles = [base + quote(name.replace(" ", "_"), safe=":/") for name in names]
+    for name, url in zip(names, articles):
+        source.pages[url] = html(name)
+    source.run(db, (root,))
+    states = [source.run(db, (root,))["roots"][root]["api"] for _ in range(3)]
+    assert [state["complete"] for state in states] == [False, False, True]
+    assert len(source.route_calls) == 1
+    assert [c["apnamespace"] for c in source.api_calls] == [["0"], ["100"], ["100"]]
+    assert source.api_calls[-1]["apcontinue"] == ["Teil B"]
+    for url in articles:
+        assert web.read_web_page(db, url, (root,))["status"] == "reference"
+    source.calls.clear()
+    source.run(db, (root,))
+    assert source.calls == []
+
+
+def test_custom_article_route_keeps_the_configured_section_boundary(tmp_path):
+    root = "https://wiki.example/artikel/Manual/"
+    source = MediaWikiAPI(root, [batch(0, "Manual/Engine", namespaces={"0": NAMESPACES["0"]},
+                                        following="Other"), batch(0, "Other/Unrelated")])
+    source.general["articlepath"] = "/artikel/$1"
+    source.pages[root + "Engine"] = html("Engine")
+    db = tmp_path / "wiki.sqlite3"
+    source.run(db, (root,))
+    source.run(db, (root,))
+    result = source.run(db, (root,))["roots"][root]["api"]
+    assert not result["complete"] and result["reason"] == "listed_titles_outside_crawl_scope"
+    assert web.read_web_page(db, root + "Engine", (root,))["status"] == "reference"
+    assert not any("/Other/" in url for url, _ in source.calls)
+
+
+@pytest.mark.parametrize("bad", [
+    "/other-game/$1", "//other.example/artikel/$1", "/artikel/../../$1",
+    "/artikel/$1?action=edit", None,
+])
+def test_custom_scope_needs_publisher_route_evidence_before_listing(tmp_path, bad):
+    root, db = "https://wiki.example/artikel/Hauptseite", tmp_path / "wiki.sqlite3"
+    source = MediaWikiAPI(root, [])
+    source.general["articlepath"] = bad
+    source.run(db, (root,))
+    api = source.run(db, (root,))["roots"][root]["api"]
+    assert api["complete"] is False and api["reason"] == "publisher_article_path_unverified"
+    assert len(source.route_calls) == 1 and source.api_calls == []
+    assert web.read_web_page(db, root, (root,))["status"] == "reference"
+
+
+def test_robots_can_decline_route_metadata_and_recover_later(tmp_path):
+    root, db = "https://wiki.example/artikel/", tmp_path / "wiki.sqlite3"
+    source = MediaWikiAPI(root, [batch(0, namespaces={"0": NAMESPACES["0"]})])
+    source.general["articlepath"] = "/artikel/$1"
+    source.robots += "Disallow: /api.php?*siprop=general\n"
+    source.run(db, (root,))
+    api = source.run(db, (root,))["roots"][root]["api"]
+    assert api["reason"] == "article_path_metadata_robots_disallowed" and not api["complete"]
+    assert source.route_calls == source.api_calls == []
+    source.now += 86401
+    source.robots = "User-agent: *\nAllow: /\n"
+    assert source.run(db, (root,))["roots"][root]["api"]["complete"] is True
+
+
+def test_upgrade_rediscovers_unchanged_landing_page_behind_redirect(tmp_path):
+    root = "https://wiki.example/artikel/"
+    landing, db = root + "Hauptseite", tmp_path / "wiki.sqlite3"
+    source = MediaWikiAPI(root, [batch(0, "Unlinked", namespaces={"0": NAMESPACES["0"]})])
+    source.general["articlepath"] = "/artikel/$1"
+    source.pages[landing] = web.Response(200, {"ETag": '"unchanged"'}, source.pages[root])
+    source.pages[root] = web.Response(301, {"Location": landing}, b"")
+    source.pages[root + "Unlinked"] = html("Unlinked")
+    source.run(db, (root,))
+    with sqlite3.connect(db) as connection:
+        # An older installation cached the landing page and ignored its API.
+        connection.execute("DELETE FROM web_apis")
+        connection.execute("ALTER TABLE web_apis DROP COLUMN article_prefix")
+    source.calls.clear()
+    source.run(db, (root,))
+    assert [h.get("If-None-Match") for u,h in source.calls if u == landing] == [None]
+    assert source.run(db, (root,))["roots"][root]["api"]["complete"]
+    assert web.read_web_page(db, root + "Unlinked", (root,))["status"] == "reference"
+
+
+def test_rejected_edit_uri_is_reported_without_contact_or_storage_of_raw_url(tmp_path):
+    root, db = "https://wiki.example/artikel/Hauptseite", tmp_path / "wiki.sqlite3"
+    source = MediaWikiAPI(root, [])
+    source.pages[root] = html("Homepage", extra='<link rel="EditURI" href="https://other.example/api.php?action=rsd">')
+    source.run(db, (root,))
+    api = source.run(db, (root,))["roots"][root]["api"]
+    assert api == {"state": "blocked", "complete": False, "reason": "api_declaration_unsupported"}
+    assert web.web_coverage(db, (root,))[root]["api"]["url"] == ""
+    assert not any("other.example" in u for u, _ in source.calls)
