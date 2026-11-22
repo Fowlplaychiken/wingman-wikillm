@@ -1,20 +1,31 @@
 # More source options
 
-## Game APIs
+## Add a source in chat
 
-Paste a public JSON collection URL in **WikiLLM settings → Other game APIs**. Use one address per line. An endpoint with article titles, text and links usually works directly. You can use it alongside a wiki or on its own.
+Say **“Add this to my library”** and paste one public HTTPS address. Use the wiki’s home address for the whole wiki or a directory ending in `/` for a section. For an API, use the URL that lists articles. WikiLLM also recognizes a public MediaWiki `api.php` address and follows it to the wiki it serves. Ask **“Check this address first”** to preview the source without turning on updates.
 
-If the publisher uses different field names, paste a one-line mapping. This example selects the Open5e *Adventurer’s Guide* conditions. [Open5e API documentation](https://open5e.com/api-docs)
+For a JSON API, WikiLLM checks the first page for article titles, text, links and pagination. When the format is unclear, it asks for the missing fields. When a publisher redirects you to a different site, paste the final public address. Sites that require a login, a browser to render their articles, or a custom API protocol can use a permitted offline export.
+
+## Map a game API
+
+In chat, you can give Wingman the collection address and tell it which fields contain the title, text and citation link. Wingman can turn those fields into a one-line mapping. You can paste an address or mapping directly into **WikiLLM settings → Other game APIs**, one per line. This example selects the Open5e *Adventurer’s Guide* conditions. [Open5e API documentation](https://open5e.com/api-docs)
 
 ```json
 {"url":"https://api.open5e.com/v2/conditions/?document__key=a5e-ag","items":"results","title":"name","text":"descriptions.0.desc","id_field":"key","url_template":"https://api.open5e.com/v2/conditions/{id}/","next":"next","total":"count"}
 ```
 
-`items` identifies the record list. `title` and `text` identify fields in each record. Use `url_field` for its original link or construct a citation from a stable ID as shown. For pagination, WikiLLM follows a same-site next-page URL in the JSON or an HTTP Link header. A declared total lets it detect missing entries. APIs requiring a sign-in or a custom protocol need an export.
+`items` identifies the record list. `title` and `text` identify fields in each record. Use `url_field` for its original link or construct a citation from a stable ID as shown. For pagination, WikiLLM follows a same-site next-page URL in the JSON or an HTTP Link header. A declared total lets it detect missing entries.
+
+```shell
+python -m wiki_llm sources preview https://wiki.openttd.org/en/Manual/Tutorial/
+python -m wiki_llm sources add https://wiki.openttd.org/en/Manual/Tutorial/
+```
 
 ## Updates and offline coverage
 
 For a wiki that declares the GNU Free Documentation License in its copyright footer or document license link, WikiLLM checks the complete license at the publisher's own address. When storage is permitted, your local library keeps the original article HTML, including its notices and source links, and one copy of the publisher's license. The reader cites the article and links to the license. WikiLLM rechecks the terms and withdraws affected copies when the publisher restricts storage. On OpenTTD, all nine English Tutorial articles were readable with DNS disabled, including the closing guidance on the Buses page. [OpenTTD tutorial](https://wiki.openttd.org/en/Manual/Tutorial/) · [Publisher license](https://wiki.openttd.org/License)
+
+A separate import used the publisher's full English OpenTTD article tree. All 1,531 nonempty article files matched their saved text byte for byte with networking disabled, including nested manuals and archives. The only remaining file in the 1,532-page inventory was empty at the source. The count covers the English article tree. [Publisher revision](https://github.com/OpenTTD/wiki-data/tree/48523bd6d32b66f21d5b5602da34e3f6164609ce/Page/en)
 
 WikiLLM updates while the skill is loaded. Change **Hours between background passes** to set the schedule. The initial download continues in small batches while the publisher allows it. Unchanged pages can return a change indicator without sending their bodies again. Some sites supply whole groups of articles or lack change indicators. Switch **Check online wikis for updates** off for offline use.
 

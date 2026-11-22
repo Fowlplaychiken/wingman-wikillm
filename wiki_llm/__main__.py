@@ -10,6 +10,7 @@ from .dependencies.wingman_wiki.reference import community_db_path
 from .dependencies.wingman_wiki.refresh import refresh_once, snapshot_limits
 from .dependencies.wingman_wiki.snapshots import import_snapshot
 from .dependencies.wingman_wiki.source_choices import effective_sources
+from .dependencies.wingman_wiki.source_onboarding import setup_source
 from .dependencies.wingman_wiki.web_sources import parse_roots
 
 
@@ -32,6 +33,11 @@ def main():
     article.add_argument("url")
     article.add_argument("--offset", type=int, default=0)
     commands.add_parser("status", help="Show local coverage of enabled sources")
+    sources = commands.add_parser("sources", help="Check, add or manage a public wiki or JSON collection")
+    sources.add_argument("action", choices=("list", "preview", "add", "pause", "resume", "remove"))
+    sources.add_argument("source", nargs="?", help="One public address or JSON field mapping")
+    sources.add_argument("--kind", choices=("auto", "wiki", "api"), default="auto",
+                         help="Only needed if the same address is saved as both a wiki and an API")
     refresh = commands.add_parser("refresh", help="Update enabled sources once")
     refresh.add_argument("--batch-size", type=int, default=5)
     refresh.add_argument("--no-galactapedia", action="store_true", help="Skip the community Galactapedia API")
@@ -46,9 +52,12 @@ def main():
     try:
         roots = parse_roots("\n".join(args.wiki))
         feeds = parse_feeds("\n".join(args.api))
-        roots, feeds = effective_sources(db, roots, feeds)
+        if args.command != "sources":
+            roots, feeds = effective_sources(db, roots, feeds)
         options = {"include_star_citizen": not args.no_sc, "roots": roots, "feeds": feeds}
-        if args.command == "lookup":
+        if args.command == "sources":
+            result = setup_source(db, args.action, args.source, args.kind, roots, feeds)
+        elif args.command == "lookup":
             result = lookup(Path(__file__).with_name("guides"), args.query, args.build, db, **options)
         elif args.command == "history":
             result = note_history(args.topic, db, args.before)
@@ -71,6 +80,8 @@ def main():
         parser.error(str(exc))
     print(json.dumps(result, ensure_ascii=True))
     if args.command == "verify" and result["status"] == "incomplete":
+        raise SystemExit(1)
+    if args.command == "sources" and result["status"] in {"blocked", "needs_input", "not_found", "retry_later", "unavailable"}:
         raise SystemExit(1)
 
 
