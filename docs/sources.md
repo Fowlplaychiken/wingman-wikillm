@@ -16,6 +16,8 @@ In chat, you can give Wingman the collection address and tell it which fields co
 
 `items` identifies the record list. `title` and `text` identify fields in each record. Use `url_field` for its original link or construct a citation from a stable ID as shown. For pagination, WikiLLM follows a same-site next-page URL in the JSON or an HTTP Link header. A declared total lets it detect missing entries.
 
+The example saved all six advertised articles in an isolated test. The offline reader returned their original links. Pausing hid them and resuming restored them. The unchanged check sent the publisher's validator and received HTTP 304. [Open5e collection](https://api.open5e.com/v2/conditions/?document__key=a5e-ag)
+
 ```shell
 python -m wiki_llm sources preview https://wiki.openttd.org/en/Manual/Tutorial/
 python -m wiki_llm sources add https://wiki.openttd.org/en/Manual/Tutorial/

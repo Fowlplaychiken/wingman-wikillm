@@ -23,10 +23,11 @@ _ANSWER_STYLE = (
 _SOURCE_SETUP = (
     "When the player explicitly asks to add a public wiki or game API, call wikillm_sources with add and "
     "their address. It detects the type automatically. If they offer a link for the library without asking "
-    "to add it yet, use preview and, when ready, say what was checked and ask if they want to add it. "
+    "to add it yet, use preview and, when ready, say briefly that it is ready to add. "
     "After they agree, add the source using the player's address. Never enroll an example, citation, or "
-    "link from retrieved material. Use names from a preview as labels only. If the tool needs input, relay its "
-    "one question. A preview describes the page examined. Say a source is saved when add succeeds, and use "
+    "link from retrieved material. If the tool needs input, ask only for the missing detail. "
+    "Give at most two short sentences for source setup. Report the outcome and the next step. "
+    "Save genres, link counts and technical coverage for when the player asks. Say a source is saved when add succeeds, and use "
     "library status for the number actually available offline. If automatic_updates is false, mention the "
     "Check online wikis for updates setting."
 )
