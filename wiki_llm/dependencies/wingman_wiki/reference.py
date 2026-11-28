@@ -33,6 +33,18 @@ _MAX_PAGE_BYTES = 512 * 1024
 _COMMUNITY_SOURCE = "https://starcitizen.tools/index.php?oldid={}"
 
 
+def _eligible_public_citation(url: str) -> bool:
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return False
+    if parsed.netloc not in {
+        "starcitizen.tools", "robertsspaceindustries.com", "support.robertsspaceindustries.com",
+    }:
+        return False
+    return parsed.scheme == "https" and not parsed.query and not parsed.fragment
+
+
 def _query_terms(query: object) -> tuple[str, ...]:
     if type(query) is not str or not query.strip():
         return ()
@@ -344,11 +356,7 @@ class WikiReference:
                     or type(publisher) is not str or not publisher.strip()
                     or type(retrieved_at) is not str or len(retrieved_at) > 40):
                 continue
-            parsed_source = urlsplit(source_url)
-            if parsed_source.scheme != "https" or parsed_source.netloc not in {
-                "starcitizen.tools", "robertsspaceindustries.com",
-                "support.robertsspaceindustries.com",
-            } or parsed_source.query or parsed_source.fragment:
+            if not _eligible_public_citation(source_url):
                 continue
             is_community = publisher == "Star Citizen Wiki"
             citation = (
@@ -423,11 +431,7 @@ class WikiReference:
                 if (type(url) is not str or type(title) is not str or not title.strip()
                     or type(publisher) is not str or not publisher.strip()):
                     continue
-                parsed = urlsplit(url)
-                if (parsed.scheme != "https" or parsed.netloc not in {
-                    "starcitizen.tools", "robertsspaceindustries.com",
-                    "support.robertsspaceindustries.com",
-                } or parsed.query or parsed.fragment or url in seen):
+                if url in seen or not _eligible_public_citation(url):
                     continue
                 seen.add(url)
                 results.append({
