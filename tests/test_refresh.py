@@ -147,6 +147,32 @@ def test_body_vocabulary_is_discovery_only_and_replaced_on_refresh(tmp_path):
                                   (corpus.COMMUNITY + "/Alpha",)).fetchone() == ("page_vocabulary_changed",)
 
 
+def test_local_search_keeps_valid_citations_when_one_saved_url_is_malformed(tmp_path):
+    from wiki_llm.dependencies.wingman_wiki.reference import WikiReference
+
+    path = tmp_path / "wiki.sqlite3"
+    valid = corpus.COMMUNITY + "/Core_heat"
+    invalid = "https://[broken/core-heat"
+    title = "Core heat"
+    publisher = "Star Citizen Wiki"
+    updated = "2026-11-28T10:00:00Z"
+    with contextlib.closing(sqlite3.connect(path)) as db, db:
+        db.executescript(corpus.SCHEMA)
+        for page_id, url in enumerate((valid, invalid), start=100):
+            db.execute("INSERT INTO pages VALUES (?, ?, ?, ?, ?, ?)",
+                       (page_id, title, page_id, updated, "", "Core heat reference."))
+            db.execute("INSERT INTO page_sources VALUES (?, ?, ?, ?)",
+                       (page_id, url, publisher, updated))
+            db.execute("INSERT INTO wiki_urls VALUES (?, ?, ?, ?, ?)",
+                       (url, None, page_id, updated, "indexed"))
+            db.execute("INSERT INTO catalog_search VALUES (?, ?, ?)", (url, title, publisher))
+
+    assert [row["citation"] for row in WikiReference.search_catalog(title, path)] == [valid]
+    assert [row["citation"] for row in WikiReference.search_community(title, path)] == [
+        corpus.COMMUNITY + "/index.php?oldid=100"
+    ]
+
+
 def test_structured_page_without_excerpt_is_retained_for_discovery(tmp_path):
     from wiki_llm.dependencies.wingman_wiki.library import library_status, lookup, read_page
     db = tmp_path / "wiki.sqlite3"
